@@ -59,6 +59,9 @@ jobs:
     - name: Debug environment
       run: python -m pip freeze
 
+    - name: List directories
+      run: ls -R
+
     - name: Test with pytest
       run: |
         python -m pytest --cov=supermage --cov-report term --cov-report xml --cov-config .coveragerc --junitxml=testresults.xml supermage/supermage/tests
