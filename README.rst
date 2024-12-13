@@ -5,4 +5,3 @@ SuperMAGE: **Super**massive black hole **m**asses from **A**LMA observations of 
 
 
 NOTE: Active development. Non-functioning and untested code may occur.
-
