@@ -7,6 +7,6 @@ path = name.lower().replace("-", "_").replace(" ", "_")
 version = "0.1.1"
 author = "Michael James Yantovski Barth"
 author_email = "mjb299@pitt.edu"
-description = "Supermassive black hole masses from ALMA observations of gas kinematics"  # One-liner
+description = "SMBH masses from ALMA observations of gas kinematics"  # One-liner
 url = ""  # your project homepage
 license = "Unlicense"  # See https://choosealicense.com
