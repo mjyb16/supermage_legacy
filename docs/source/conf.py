@@ -127,7 +127,6 @@ def auto_convert_readme(_):
         pandoc_dir = os.path.join(DOCS_DIR, "bin")
         os.environ["PATH"] += os.pathsep + pandoc_dir
         pypandoc.ensure_pandoc_installed(
-            quiet=True,
             targetfolder=pandoc_dir,
             delete_installer=True,
         )
