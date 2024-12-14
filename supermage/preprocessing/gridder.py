@@ -2,37 +2,6 @@ import numpy as np
 from scipy.spatial import cKDTree
 from tqdm import tqdm
 
-def grid(pixel_scale, img_size): 
-    """
-    Given a pixel scale and a number of pixels in image space, grid the associated Fourier space
-
-    Args:
-        pixel_scale (float): Pixel resolution in image space (in arcsec)
-        img_size (float/int): Size of the image
-    
-    Returns:
-        edges coordinates of the grid in uv space.     
-    """
-
-    # Arcsec to radians: 
-    dl = (pixel_scale * u.arcsec).to(u.radian).value
-    dm = (pixel_scale * u.arcsec).to(u.radian).value
-
-    du = 1 / (img_size * dl) * 1e-3 # klambda
-    dv = 1 / (img_size * dm) * 1e-3 # klambda
-
-    u_min = -img_size/2 * du 
-    u_max =  img_size/2 * du 
-
-    v_min = -img_size/2 * dv
-    v_max =  img_size/2 * dv
-
-    u_edges = np.linspace(u_min, u_max, img_size + 1)
-    v_edges = np.linspace(v_min, v_max, img_size + 1)
-
-    return u_edges, v_edges
-
-
 # Defining some window functions. We could add more in the future but their effect needs to be taken into account in the forward model. 
 def pillbox_window(u, center, pixel_size=0.015, m=1):
     """
