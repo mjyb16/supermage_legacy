@@ -19,7 +19,7 @@ class MGEVelocity(Module):
     """
 
     def __init__(self, N_components: int):
-        super().__init__(name=name)
+        super().__init__()
         self.N_components = N_components
         
         # Stellar dynamical parameters
@@ -77,7 +77,7 @@ class MGEVelocity(Module):
         exp_term = torch.exp(-R_flat**2 / (2 * sigma_j**2))
         
         # Compute radial force for each Gaussian
-        G_const = G / (sqrt(2*pi)*sigma_j**3 * q_j)
+        G_const = G / (sqrt(2*torch.tensor(pi, device = "cuda"))*sigma_j**3 * q_j)
         F_R_j = G_const * M_j * R_flat * exp_term   # [N, N_gauss]
         
         F_R_total = F_R_j.sum(dim=1)  # [N]

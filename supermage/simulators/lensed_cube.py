@@ -4,8 +4,8 @@ from caustics import Module, forward, Param
 #MODIFY MODIFY MODIFY!!!!!!!
 
 class LensedCubeSimulator(Module):
-    def __init__(self, cube_simulator, lens_model, name="LensedCubeSimulator"):
-        super().__init__(name=name)
+    def __init__(self, cube_simulator, lens_model):
+        super().__init__()
         self.cube_simulator = cube_simulator
         self.lens_model = lens_model
 

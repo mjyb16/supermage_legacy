@@ -5,8 +5,8 @@ import numpy as np
 #MODIFY MODIFY MODIFY!!!!!!!
 
 class VisibilityCubeSimulator(Module):
-    def __init__(self, cube_simulator, data_u, data_v, paduv, freqs, dish_diameter=12, name="VisibilityCubeSimulator"):
-        super().__init__(name=name)
+    def __init__(self, cube_simulator, data_u, data_v, paduv, freqs, dish_diameter=12):
+        super().__init__()
         self.cube_simulator = cube_simulator
         self.data_u = data_u
         self.data_v = data_v
