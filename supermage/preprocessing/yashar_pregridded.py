@@ -1,5 +1,5 @@
 import numpy as np
-from supermage.utils.uv_utils import generate_binned_data, generate_binned_counts, generate_uv_mask, generate_pb
+from supermage.utils.uv_utils import generate_binned_data, generate_binned_counts, generate_uv_mask, gaussian_pb
 from supermage.utils.coord_utils import pixel_size_background
 
 

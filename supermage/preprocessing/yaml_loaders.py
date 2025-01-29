@@ -5,7 +5,7 @@ import caustics.cosmology
 import caustics.lenses
 from caustics.light.pixelated import Pixelated
 import supermage.preprocessing.yashar_pregridded
-from supermage.utils.uv_utils import generate_binned_data, generate_binned_counts, generate_uv_mask, generate_pb
+from supermage.utils.uv_utils import generate_binned_data, generate_binned_counts, generate_uv_mask, gaussian_pb
 from supermage.utils.coord_utils import pixel_size_background
 import yaml
 
