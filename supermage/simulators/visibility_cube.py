@@ -1,5 +1,5 @@
 import torch
-from caustics import Module, forward
+from caskade import Module, forward, Param
 import numpy as np
 
 #MODIFY MODIFY MODIFY!!!!!!!

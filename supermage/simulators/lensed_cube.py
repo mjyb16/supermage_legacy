@@ -1,32 +1,56 @@
 import torch
-from caustics import Module, forward, Param
+from caskade import Module, forward, Param
+from torch import vmap
+import caustics
+from caustics.light import Pixelated
+from torch.nn.functional import avg_pool2d, conv2d
 
-#MODIFY MODIFY MODIFY!!!!!!!
 
-class LensedCubeSimulator(Module):
-    def __init__(self, cube_simulator, lens_model):
-        super().__init__()
-        self.cube_simulator = cube_simulator
-        self.lens_model = lens_model
+class CubeLens(Module):
+    def __init__(
+        self,
+        lens,
+        source_cube,
+        pixelscale_source,
+        pixelscale_lens,
+        pixels_x_source,
+        pixels_x_lens,
+        upsample_factor,
+        name: str = "sim",
+    ):
+        super().__init__(name)
 
-        self.z_background = Param("z_background", None)
-        self.r_galaxy = Param("r_galaxy", None)
-        self.fov = Param("fov", None)
-        self.npix = Param("npix", None)
+        self.lens = lens
+        self.source_cube = source_cube
+        self.upsample_factor = upsample_factor
+        self.src = Pixelated(name="source", shape=(pixels_x_source, pixels_x_source), pixelscale=pixelscale_source, image = torch.zeros((pixels_x_source, pixels_x_source)))
+
+        # Create the high-resolution grid
+        thx, thy = caustics.utils.meshgrid(
+            pixelscale_lens / upsample_factor,
+            upsample_factor * pixels_x_lens,
+            dtype=torch.float32, device = "cuda"
+        )
+
+        self.thx = thx
+        self.thy = thy
 
     @forward
-    def forward(
-        self, img_x, img_y, img_z,
-        z_background=None, r_galaxy=None, fov=None, npix=None
-    ):
-        cube_unlensed = self.cube_simulator.forward(img_x, img_y, img_z)
-        lensed_result = self.lens_model.forward(
-            cube_unlensed,
-            z_background=z_background,
-            r_galaxy=r_galaxy,
-            gal_res=self.cube_simulator.gal_res.value,
-            velocity_res=self.cube_simulator.velocity_res.value,
-            fov=fov,
-            npix=npix
-        )
-        return lensed_result
+    def forward(self, lens_source = True):
+        cube = self.source_cube.forward()
+        bx, by = self.lens.raytrace(self.thx, self.thy)
+
+        def lens_channel(image):
+            if lens_source:
+                return self.src.brightness(bx, by, image = image)
+            else:
+                return self.src.brightness(self.thx, self.thy, image = image)
+        
+        # Ray-trace to get the lensed positions
+        lensed_cube = vmap(lens_channel)(cube)
+        del cube
+
+        # Downsample to the desired resolution
+        lensed_cube = avg_pool2d(lensed_cube[:, None], self.upsample_factor)[:, 0]
+
+        return lensed_cube

@@ -1,6 +1,6 @@
 import torch
 from torch import pi, sqrt
-from caustics import Module, forward, Param
+from caskade import Module, forward, Param
 from caustics.light.base import Source
 import numpy as np
 from pykeops.torch import LazyTensor

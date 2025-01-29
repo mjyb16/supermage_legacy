@@ -1,11 +1,11 @@
 import torch
 from math import pi
-from caustics import Module, forward, Param
+from caskade import Module, forward, Param
 from pykeops.torch import LazyTensor
 from supermage.utils.math_utils import DoRotation, DoRotationT
 
 class CubeSimulator(Module):
-    def __init__(self, velocity_model, intensity_model):
+    def __init__(self, velocity_model, intensity_model, img_x, img_y, img_z):
         super().__init__()
         self.velocity_model = velocity_model
         self.intensity_model = intensity_model
@@ -18,15 +18,19 @@ class CubeSimulator(Module):
         self.velocity_max = Param("velocity_max", None)
         self.line_broadening = Param("line_broadening", None)
 
+        self.img_x = img_x
+        self.img_y = img_y
+        self.img_z = img_z
+
     @forward
     def forward(
-        self, img_x, img_y, img_z,
+        self,
         inclination=None, sky_rot=None,
         gal_res=None, velocity_res=None,
         velocity_min=None, velocity_max=None,
         line_broadening=None
     ):
-        rot_x, rot_y, rot_z = DoRotation(img_x, img_y, img_z, inclination, sky_rot)
+        rot_x, rot_y, rot_z = DoRotation(self.img_x, self.img_y, self.img_z, inclination, sky_rot)
         #print(rot_x)
 
         v_abs = self.velocity_model.velocity(rot_x, rot_y, rot_z).nan_to_num(posinf=0, neginf=0)
