@@ -2,7 +2,7 @@ import torch
 
 def _func_R_x(theta, device = "cuda"):
     result = torch.zeros((3, 3), device = device)
-    result[0, 0] = torch.tensor(1, device = device)
+    result[0, 0] = 1
     result[1, 1] = torch.cos(theta)
     result[1, 2] = -torch.sin(theta)
     result[2, 1] = torch.sin(theta)
@@ -13,7 +13,7 @@ def _func_R_y(psi, device = "cuda"):
     result = torch.zeros((3, 3), device = device)
     result[0, 0] = torch.cos(psi)
     result[0, 2] = torch.sin(psi)
-    result[1, 1] = torch.tensor(1, device = device)
+    result[1, 1] = 1
     result[2, 0] = -torch.sin(psi)
     result[2, 2] = torch.cos(psi)
     return result
@@ -24,7 +24,7 @@ def _func_R_z(phi, device = "cuda"):
     result[0, 1] = -torch.sin(phi)
     result[1, 0] = torch.sin(phi)
     result[1, 1] = torch.cos(phi)
-    result[2, 2] = torch.tensor(1, device = device)
+    result[2, 2] = 1
     return result
 
 def DoRotation(x, y, z, theta, phi, device = "cuda"):

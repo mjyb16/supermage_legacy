@@ -41,7 +41,7 @@ class CubeSimulator(Module):
         self.sky_rot = Param("sky_rot", None)
         self.line_broadening = Param("line_broadening", None)
 
-        #Image grid
+        # Image grid
         self.image_res = image_res
         meshgrid = generate_meshgrid(cube_fov, image_res, device="cuda")
         self.img_x = meshgrid[0]
@@ -56,7 +56,11 @@ class CubeSimulator(Module):
         cube_z_labels = cube_z_labels * torch.ones((image_res, image_res, velocity_res), device = "cuda")
         self.cube_z_l_keops = LazyTensor(cube_z_labels.unsqueeze(-1).expand(image_res, image_res, velocity_res, 1)[:, :, :, None, :])
 
-        #Constant
+        # Output resolutions
+        self.velocity_res_out = velocity_res_out
+        self.image_res_out = image_res_out
+
+        # Constants
         self.pi = torch.tensor(pi, device = "cuda")
 
     @forward
@@ -83,7 +87,25 @@ class CubeSimulator(Module):
         cube = (kde_dist @ intensity_cube) * (1/torch.sqrt(2*self.pi*sig_sq))
         cube_final = torch.squeeze(cube)
 
-        return torch.movedim(cube_final, -1, 0)
+        cube_final_3D = cube_final.permute(2, 0, 1)  # (velocity_res, image_res, image_res)
+
+        # Expand to (N=1, C=1, D, H, W)
+        cube_5d = cube_final_3D.unsqueeze(0).unsqueeze(0)
+
+        # Compute integer pooling sizes (assumes integral ratios)
+        kernel_d = self.velocity_res // self.velocity_res_out
+        kernel_h = self.image_res // self.image_res_out
+        kernel_w = self.image_res // self.image_res_out
+
+        # Use average pooling to downsample
+        cube_downsampled = F.avg_pool3d(
+            cube_5d,
+            kernel_size=(kernel_d, kernel_h, kernel_w),
+            stride=(kernel_d, kernel_h, kernel_w)
+        )
+        # Shape => (1, 1, velocity_res_out, image_res_out, image_res_out)
+        cube_downsampled = cube_downsampled.squeeze(0).squeeze(0)
+        return cube_downsampled
 
 class CubeSimulator_GPT(Module):
     def __init__(
