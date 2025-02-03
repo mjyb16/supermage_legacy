@@ -61,6 +61,8 @@ class VisibilityCube(Module):
         if plot:
             # Simply multiply by the mask (broadcasting if needed)
             mask_f = self.mask.float()  # shape (N_chan, Nx, Ny)
+            del cube
+            torch.cuda.empty_cache()
             return fft_results * mask_f
         else:
             # We want only the masked values. Let's define a small helper 
@@ -75,5 +77,6 @@ class VisibilityCube(Module):
             # This will return shape (N_chan, #Trues) if each channel has the same #Trues
             visibilities_result = torch.vmap(gather_masked)(fft_results, self.mask)
             # shape: (N_chan, #Trues)
-
+            del cube
+            torch.cuda.empty_cache()
             return visibilities_result

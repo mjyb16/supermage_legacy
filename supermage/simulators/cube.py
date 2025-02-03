@@ -111,4 +111,5 @@ class CubeSimulator(Module):
         )
         # Shape => (1, 1, velocity_res_out, image_res_out, image_res_out)
         cube_downsampled = cube_downsampled.squeeze(0).squeeze(0)
+        torch.cuda.empty_cache()
         return cube_downsampled

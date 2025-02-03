@@ -52,5 +52,5 @@ class CubeLens(Module):
 
         # Downsample to the desired resolution
         lensed_cube = avg_pool2d(lensed_cube[:, None], self.upsample_factor)[:, 0]
-
+        torch.cuda.empty_cache()
         return lensed_cube
