@@ -12,9 +12,9 @@ class VisibilityCube(Module):
         #paduv, 
         mask,
         freqs, 
-        dish_diameter=12, 
-        shape=(500, 500), 
-        deltal=0.004, 
+        npix,
+        pixelscale,
+        dish_diameter=12,  
         device="cuda"
     ):
         super().__init__()
@@ -25,8 +25,8 @@ class VisibilityCube(Module):
         self.mask = mask
         self.freqs = freqs
         self.dish_diameter = dish_diameter
-        self.shape = shape
-        self.deltal = deltal
+        self.npix = npix
+        self.pixelscale = pixelscale
         self.device = device
 
         # Create primary beams
@@ -35,8 +35,8 @@ class VisibilityCube(Module):
             pb, _ = gaussian_pb(
                 diameter=dish_diameter,
                 freq=freq,
-                shape=shape,
-                deltal=deltal,
+                shape=(npix, npix),
+                deltal=pixelscale,
                 device=device
             )
             pbs.append(pb)
@@ -50,9 +50,9 @@ class VisibilityCube(Module):
             # x_slice, pb_slice: each shape (Nx, Ny)
             fft_result = torch.fft.fftshift(
                 torch.fft.fft2(
-                    torch.fft.ifftshift(x_slice * pb_slice, norm="ortho")
+                    torch.fft.ifftshift(x_slice * pb_slice), 
+                    norm="ortho")
                 )
-            )
             return fft_result
             
         fft_results = torch.vmap(fft_channel)(cube, self.primary_beams)
