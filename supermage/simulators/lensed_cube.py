@@ -57,6 +57,18 @@ class CubeLens(Module):
 
 
 class CubePosition(Module):
+    """
+    Generates an off-center (x, y position offset in arcsec) cube with the correct padding to match the FOV of the data. Note that the x offset parameter is in negative RA so that it increases from left to right.
+    Parameters
+    ----------
+    source_cube (Module): The source 3D cube to be lensed.
+    pixelscale_source (float): The pixel scale for the source cube.
+    pixelscale_lens (float): The pixel scale for the output grid.
+    pixels_x_source (int): The number of pixels in the source cube in the x-direction.
+    pixels_x_lens (int): The number of pixels in the output grid in the x-direction.
+    upsample_factor (int): The factor by which to upsample the image for lensing.
+    name (str, optional): The name of the module. Default is "sim".
+    """
     def __init__(
         self,
         source_cube,

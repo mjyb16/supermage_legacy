@@ -26,14 +26,14 @@ class CubeSimulator(Module):
         Factor by which velocity_res_out is multiplied. High internal resolution needed to prevent aliasing (rec. 5x).
     velocity_min, velocity_max : float
         Velocity range (in m/s).
-    cube_fov : float
-        Spatial extent of the cube (pc).
+    cube_fov_half : float
+        Spatial extent of the cube (pc). Gives half length of one side.
     image_res_out : int
         Final (downsampled) number of image pixels (2D) returned for the cube's spatial dimensions.
     image_upscale : int
         Factor by which image_res_out is multiplied. High internal resolution can be needed to prevent aliasing.
     """
-    def __init__(self, velocity_model, intensity_model, velocity_res_out, velocity_upscale, velocity_min, velocity_max, cube_fov, image_res_out, image_upscale):
+    def __init__(self, velocity_model, intensity_model, velocity_res_out, velocity_upscale, velocity_min, velocity_max, cube_fov_half, image_res_out, image_upscale):
         super().__init__()
         self.velocity_model = velocity_model
         self.intensity_model = intensity_model
@@ -49,7 +49,7 @@ class CubeSimulator(Module):
         self.image_upscale    = image_upscale
 
         # Image grid        
-        meshgrid = generate_meshgrid(cube_fov, self.image_res, device="cuda")
+        meshgrid = generate_meshgrid(cube_fov_half, self.image_res, device="cuda")
         self.img_x = meshgrid[0]
         self.img_y = meshgrid[1]
         self.img_z = meshgrid[2]
