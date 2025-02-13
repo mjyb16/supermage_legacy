@@ -41,6 +41,7 @@ class CubeSimulator(Module):
         self.inclination = Param("inclination", None)
         self.sky_rot = Param("sky_rot", None)
         self.line_broadening = Param("line_broadening", None)
+        #self.flux = Param("flux", None)
 
         # Internal resolutions
         self.velocity_res = velocity_res_out * velocity_upscale
@@ -65,6 +66,8 @@ class CubeSimulator(Module):
         # Output resolutions
         self.velocity_res_out = velocity_res_out
         self.image_res_out = image_res_out
+        self.dv = (velocity_max_pc - velocity_min_pc) / self.velocity_res_out
+        self.dx = self.dy = 2*cube_fov_half/image_res_out
 
         # Constants
         self.pi = torch.tensor(pi, device = "cuda")
@@ -72,7 +75,7 @@ class CubeSimulator(Module):
     @forward
     def forward(
         self,
-        inclination=None, sky_rot=None, line_broadening=None
+        inclination=None, sky_rot=None, line_broadening=None#, flux = None
     ):
         rot_x, rot_y, rot_z = DoRotation(self.img_x, self.img_y, self.img_z, inclination, sky_rot)
 
@@ -111,5 +114,11 @@ class CubeSimulator(Module):
         )
         # Shape => (1, 1, velocity_res_out, image_res_out, image_res_out)
         cube_downsampled = cube_downsampled.squeeze(0).squeeze(0)
+
+        #raw_sum = cube_downsampled.sum().item()  # just the sum of array entries
+        #voxel_area = self.dx * self.dy * self.dv  # for line emission integrated in 3D
+        #flux_measured = raw_sum * voxel_area
+        #scale_factor = flux / flux_measured
+        #cube_downsampled *= scale_factor
         torch.cuda.empty_cache()
         return cube_downsampled

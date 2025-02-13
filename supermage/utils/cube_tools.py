@@ -26,7 +26,7 @@ def dirty_cube_tool(vis_bin_re_cube, vis_bin_imag_cube, roi_start, roi_end):
         combined_vis = vis_bin_re_cube[i] + 1j * vis_bin_imag_cube[i]
         
         # Perform the inverse FFT to get the dirty image in the image plane
-        dirty_image = np.fft.fftshift(np.fft.ifft2(np.fft.ifftshift(combined_vis)))
+        dirty_image = np.fft.fftshift(np.fft.ifft2(np.fft.ifftshift(combined_vis), norm = "backward"))
         
         # Take the real part (intensity map) and restrict to the region of interest
         dirty_image_roi = np.abs(dirty_image)[roi_start:roi_end, roi_start:roi_end]

@@ -27,7 +27,11 @@ class VisibilityCube(Module):
         self.dish_diameter = dish_diameter
         self.npix = npix
         self.pixelscale = pixelscale
+        self.flux = Param("flux", None)
         self.device = device
+
+        #pixelscale_rad = self.pixelscale * (np.pi / 180.0) / 3600.0  # arcsec -> radians
+        #self.pixel_area_sr = pixelscale_rad**2
 
         # Create primary beams
         pbs = []
@@ -43,19 +47,24 @@ class VisibilityCube(Module):
         self.primary_beams = torch.stack(pbs, dim=0)  # shape (N_freq, Nx, Ny)
 
     @forward
-    def forward(self, plot):
+    def forward(self, plot, flux = None):
         cube = self.cube_simulator.forward()
 
-        def fft_channel(x_slice, pb_slice):
+        def pb_cube(x_slice, pb_slice):
+            return x_slice*pb_slice
+
+        def fft_channel(x_slice):
             # x_slice, pb_slice: each shape (Nx, Ny)
             fft_result = torch.fft.fftshift(
                 torch.fft.fft2(
-                    torch.fft.ifftshift(x_slice * pb_slice), 
-                    norm="ortho")
+                    torch.fft.ifftshift(x_slice), 
+                    norm="forward")
                 )
             return fft_result
-            
-        fft_results = torch.vmap(fft_channel)(cube, self.primary_beams)
+
+        pb_results = torch.vmap(pb_cube)(cube, self.primary_beams)
+        normed_result = flux*pb_results/pb_results.sum()
+        fft_results = torch.vmap(fft_channel)(normed_result)
         # fft_results: shape (N_freq, Nx, Ny), dtype=complex64
     
         if plot:

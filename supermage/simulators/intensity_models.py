@@ -2,7 +2,7 @@ import torch
 from caustics import Module, forward, Param
 
 
-class ExponentialUnnorm(Module):
+class ExponentialUnnorm(Module): #Rename to toroid?
     def __init__(self):
         super().__init__()
         self.sigma = Param("sigma", None)
@@ -26,19 +26,20 @@ class ExponentialDisk3D(Module):
     - scale: Radial scale length
     - sigma_z: Vertical dispersion
     - mu_z: Vertical mean offset
+    - thindisk: Boolean, if true, overrides thick disk assumption
     """
 
-    def __init__(self):
+    def __init__(self, thindisk):
         super().__init__()
 
         # Register parameters
-        self.I0 = Param("I0", None)
         self.scale = Param("scale", None)
         self.sigma_z = Param("sigma_z", None)
         self.mu_z = Param("mu_z", None)
+        self.thindisk = thindisk
 
     @forward
-    def brightness(self, x, y, z, I0=None, scale=None, sigma_z=None, mu_z=None):
+    def brightness(self, x, y, z, scale=None, sigma_z=None, mu_z=None):
         """
         Computes the intensity at positions (x, y, z).
 
@@ -46,14 +47,17 @@ class ExponentialDisk3D(Module):
         ----------
         x, y, z : Tensor
             Coordinates at which the intensity is evaluated.
-        I0, scale, sigma_z, mu_z : Tensors
+        scale, sigma_z, mu_z : Tensors
             Model parameters provided by caskade.
         """
         r = torch.sqrt(x**2 + y**2)
-        print((I0, scale, sigma_z, mu_z))
-        intensity = I0 * torch.exp(-r/scale - 0.5*(z - mu_z)**2 / sigma_z**2)
-        print(intensity)
-        return intensity
+        if self.thindisk:
+            dz = z[0,0,1] - z[0,0,0]
+            shape = torch.exp(-r/scale) * torch.exp(-torch.abs(z)/dz)
+            return shape
+        else:
+            intensity = torch.exp(-r/scale - 0.5*(z - mu_z)**2 / sigma_z**2)
+            return intensity
     
     
     
