@@ -1,9 +1,13 @@
 import torch
+from torch import vmap
 from math import pi
 from caskade import Module, forward, Param
 from pykeops.torch import LazyTensor
 from supermage.utils.math_utils import DoRotation, DoRotationT
 import torch.nn.functional as F
+import caustics
+from caustics.light import Pixelated
+from torch.nn.functional import avg_pool2d, conv2d
 
 def generate_meshgrid(grid_extent, gal_res, device = "cuda"):
     """
@@ -41,6 +45,7 @@ class CubeSimulator(Module):
         self.inclination = Param("inclination", None)
         self.sky_rot = Param("sky_rot", None)
         self.line_broadening = Param("line_broadening", None)
+        self.velocity_offset = Param("velocity_offset", None)
         #self.flux = Param("flux", None)
 
         # Internal resolutions
@@ -75,11 +80,13 @@ class CubeSimulator(Module):
     @forward
     def forward(
         self,
-        inclination=None, sky_rot=None, line_broadening=None#, flux = None
+        inclination=None, sky_rot=None, line_broadening=None, velocity_offset = None
     ):
         rot_x, rot_y, rot_z = DoRotation(self.img_x, self.img_y, self.img_z, inclination, sky_rot)
 
         v_abs = self.velocity_model.velocity(rot_x, rot_y, rot_z).nan_to_num(posinf=0, neginf=0)
+        # Convert offset to pc/s
+        v_offset_pc = velocity_offset / 3.086e16
         
         theta_rot = torch.atan2(rot_y, rot_x)
         v_x = -v_abs * torch.sin(theta_rot)
@@ -92,7 +99,7 @@ class CubeSimulator(Module):
 
         intensity_cube = source_img_cube.unsqueeze(-1)
         sig_sq = line_broadening**2
-        kde_dist = (-1*(self.cube_z_l_keops - v_los_keops)**2 / sig_sq).exp()
+        kde_dist = (-1*(self.cube_z_l_keops - (v_los_keops + v_offset_pc))**2 / sig_sq).exp()
         cube = (kde_dist @ intensity_cube) * (1/torch.sqrt(2*self.pi*sig_sq))
         cube_final = torch.squeeze(cube)
 
@@ -122,3 +129,58 @@ class CubeSimulator(Module):
         #cube_downsampled *= scale_factor
         torch.cuda.empty_cache()
         return cube_downsampled
+
+class CubePosition(Module):
+    """
+    Generates an off-center (x, y position offset in arcsec) cube with the correct padding to match the FOV of the data. Note that the x offset parameter is in negative RA so that it increases from left to right.
+    Parameters
+    ----------
+    source_cube (Module): The source 3D cube to be lensed.
+    pixelscale_source (float): The pixel scale for the source cube.
+    pixelscale_lens (float): The pixel scale for the output grid.
+    pixels_x_source (int): The number of pixels in the source cube in the x-direction.
+    pixels_x_lens (int): The number of pixels in the output grid in the x-direction.
+    upsample_factor (int): The factor by which to upsample the image for lensing.
+    name (str, optional): The name of the module. Default is "sim".
+    """
+    def __init__(
+        self,
+        source_cube,
+        pixelscale_source,
+        pixelscale_lens,
+        pixels_x_source,
+        pixels_x_lens,
+        upsample_factor,
+        name: str = "sim",
+    ):
+        super().__init__(name)
+        
+        self.source_cube = source_cube
+        self.upsample_factor = upsample_factor
+        self.src = Pixelated(name="source", shape=(pixels_x_source, pixels_x_source), pixelscale=pixelscale_source, image = torch.zeros((pixels_x_source, pixels_x_source)))
+
+        # Create the high-resolution grid
+        thx, thy = caustics.utils.meshgrid(
+            pixelscale_lens / upsample_factor,
+            upsample_factor * pixels_x_lens,
+            dtype=torch.float32, device = "cuda"
+        )
+
+        self.thx = thx
+        self.thy = thy
+
+    @forward
+    def forward(self):
+        cube = self.source_cube.forward()
+
+        def lens_channel(image):
+            return self.src.brightness(self.thx, self.thy, image = image)
+        
+        # Ray-trace to get the lensed positions
+        lensed_cube = vmap(lens_channel)(cube)
+        del cube
+
+        # Downsample to the desired resolution
+        lensed_cube = avg_pool2d(lensed_cube[:, None], self.upsample_factor)[:, 0]
+        torch.cuda.empty_cache()
+        return lensed_cube
