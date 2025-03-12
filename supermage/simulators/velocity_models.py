@@ -49,10 +49,23 @@ class MGEVelocity(Module):
         
         device = x.device
         # Compute q_j intrinsic axial ratios from qobs and inc
-        cos_inc = torch.cos(inc)
-        sin_inc = torch.sin(inc)
-        q_j = torch.sqrt((qobs**2 - cos_inc**2) / sin_inc**2)
-        q_j = q_j.clamp(min=1e-3)
+        #inc_safe = torch.clamp(inc, 1e-3, np.pi - 1e-3)
+        print("Inc unsafe:")
+        print(inc)
+        eps = 1e-3
+        inc_safe = eps + (np.pi - 2*eps) * torch.sigmoid(inc)
+        print("Inc safe:")
+        print(inc_safe)
+        cos_inc = torch.cos(inc_safe)
+        sin_inc = torch.sin(inc_safe)
+        print("sin_inc:")
+        print(sin_inc)
+        print("(qobs**2 - cos_inc**2)")
+        print((qobs**2 - cos_inc**2))
+        q_j_arg = (qobs**2 - cos_inc**2) / sin_inc**2
+        q_j_arg = q_j_arg.clamp(min=1e-8)
+        q_j = torch.sqrt(q_j_arg)
+        print(q_j_arg)
         
         # Compute total mass for each Gaussian
         # L_j = 2*pi*surf*sigma^2*qobs

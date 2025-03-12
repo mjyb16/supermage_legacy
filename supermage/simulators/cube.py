@@ -42,12 +42,12 @@ class CubeSimulator(Module):
         self.velocity_model = velocity_model
         self.intensity_model = intensity_model
 
-        self.inclination = Param("inclination", None)
+        self.inclination = torch.tensor([1.328196048736572], device = "cuda")#Param("inclination", None)
         self.sky_rot = Param("sky_rot", None)
         self.line_broadening = Param("line_broadening", None)
         self.velocity_offset = Param("velocity_offset", None)
 
-        self.velocity_model.inc = self.inclination
+        #self.velocity_model.inc = Param("inclination", None)#1.3281960487365723#self.inclination
         #self.flux = Param("flux", None)
 
         # Internal resolutions
@@ -83,12 +83,12 @@ class CubeSimulator(Module):
     @forward
     def forward(
         self,
-        inclination=None, sky_rot=None, line_broadening=None, velocity_offset = None
+        sky_rot=None, line_broadening=None, velocity_offset = None
     ):
-        rot_x, rot_y, rot_z = DoRotation(self.img_x, self.img_y, self.img_z, inclination, sky_rot)
+        rot_x, rot_y, rot_z = DoRotation(self.img_x, self.img_y, self.img_z, self.inclination, sky_rot)
         torch.cuda.empty_cache()
-
-        v_abs = self.velocity_model.velocity(rot_x, rot_y, rot_z).nan_to_num(posinf=0, neginf=0)/self.numerical_stability
+        print("Running velocity model")
+        v_abs = self.velocity_model.velocity(rot_x, rot_y, rot_z)/self.numerical_stability
         # Convert offset to pc/s
         v_offset_pc = velocity_offset / 3.086e16
         
@@ -96,7 +96,7 @@ class CubeSimulator(Module):
         v_x = -v_abs * torch.sin(theta_rot)
         v_y = v_abs * torch.cos(theta_rot)
 
-        v_x_r, v_y_r, v_z_r = DoRotationT(v_x, v_y, self.v_z, inclination, sky_rot)
+        v_x_r, v_y_r, v_z_r = DoRotationT(v_x, v_y, self.v_z, self.inclination, sky_rot)
         del v_x, v_y, theta_rot
         torch.cuda.empty_cache()
         v_los_keops = LazyTensor(v_z_r.unsqueeze(-1).expand(self.image_res, self.image_res, self.image_res, 1)[:, :, None, :, :])
@@ -112,7 +112,6 @@ class CubeSimulator(Module):
         del source_img_cube
         torch.cuda.empty_cache()
         sig_sq = (line_broadening/3.086e13/self.numerical_stability)**2
-        print(sig_sq)
         kde_dist = (-1*(self.cube_z_l_keops - (v_los_keops + v_offset_pc))**2 / sig_sq).exp()
         cube = (kde_dist @ intensity_cube) * (1/torch.sqrt(2*self.pi*sig_sq))
         cube_final = torch.squeeze(cube)
