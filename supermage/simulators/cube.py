@@ -37,17 +37,15 @@ class CubeSimulator(Module):
     image_upscale : int
         Factor by which image_res_out is multiplied. High internal resolution can be needed to prevent aliasing.
     """
-    def __init__(self, velocity_model, intensity_model, velocity_res_out, velocity_upscale, velocity_min, velocity_max, cube_fov_half, image_res_out, image_upscale, numerical_stability):
+    def __init__(self, velocity_model, intensity_model, velocity_res_out, velocity_upscale, velocity_min, velocity_max, cube_fov_half, image_res_out, image_upscale):
         super().__init__()
         self.velocity_model = velocity_model
         self.intensity_model = intensity_model
 
-        self.inclination = torch.tensor([1.328196048736572], device = "cuda")#Param("inclination", None)
+        self.inclination = Param("inclination", None)
         self.sky_rot = Param("sky_rot", None)
         self.line_broadening = Param("line_broadening", None)
         self.velocity_offset = Param("velocity_offset", None)
-
-        #self.velocity_model.inc = Param("inclination", None)#1.3281960487365723#self.inclination
         #self.flux = Param("flux", None)
 
         # Internal resolutions
@@ -55,7 +53,6 @@ class CubeSimulator(Module):
         self.image_res    = image_res_out * image_upscale
         self.velocity_upscale = velocity_upscale
         self.image_upscale    = image_upscale
-        self.numerical_stability = numerical_stability
 
         # Image grid        
         meshgrid = generate_meshgrid(cube_fov_half, self.image_res, device="cuda")
@@ -68,7 +65,7 @@ class CubeSimulator(Module):
         velocity_min_pc = velocity_min / 3.086e16
         velocity_max_pc = velocity_max / 3.086e16
         cube_z_labels = torch.linspace(velocity_min_pc, velocity_max_pc, self.velocity_res, device = "cuda")
-        cube_z_labels = cube_z_labels * torch.ones((self.image_res, self.image_res, self.velocity_res), device = "cuda")/self.numerical_stability
+        cube_z_labels = cube_z_labels * torch.ones((self.image_res, self.image_res, self.velocity_res), device = "cuda")
         self.cube_z_l_keops = LazyTensor(cube_z_labels.unsqueeze(-1).expand(self.image_res, self.image_res, self.velocity_res, 1)[:, :, :, None, :])
 
         # Output resolutions
@@ -83,12 +80,11 @@ class CubeSimulator(Module):
     @forward
     def forward(
         self,
-        sky_rot=None, line_broadening=None, velocity_offset = None
+        inclination=None, sky_rot=None, line_broadening=None, velocity_offset = None
     ):
-        rot_x, rot_y, rot_z = DoRotation(self.img_x, self.img_y, self.img_z, self.inclination, sky_rot)
-        torch.cuda.empty_cache()
-        print("Running velocity model")
-        v_abs = self.velocity_model.velocity(rot_x, rot_y, rot_z)/self.numerical_stability
+        rot_x, rot_y, rot_z = DoRotation(self.img_x, self.img_y, self.img_z, inclination, sky_rot)
+
+        v_abs = self.velocity_model.velocity(rot_x, rot_y, rot_z).nan_to_num(posinf=0, neginf=0)
         # Convert offset to pc/s
         v_offset_pc = velocity_offset / 3.086e16
         
@@ -96,36 +92,21 @@ class CubeSimulator(Module):
         v_x = -v_abs * torch.sin(theta_rot)
         v_y = v_abs * torch.cos(theta_rot)
 
-        v_x_r, v_y_r, v_z_r = DoRotationT(v_x, v_y, self.v_z, self.inclination, sky_rot)
-        del v_x, v_y, theta_rot
-        torch.cuda.empty_cache()
+        v_x_r, v_y_r, v_z_r = DoRotationT(v_x, v_y, self.v_z, inclination, sky_rot)
         v_los_keops = LazyTensor(v_z_r.unsqueeze(-1).expand(self.image_res, self.image_res, self.image_res, 1)[:, :, None, :, :])
-        del v_x_r, v_y_r, v_z_r
-        torch.cuda.empty_cache()
-        
+
         source_img_cube = self.intensity_model.brightness(rot_x, rot_y, rot_z)
 
-        del rot_x, rot_y, rot_z
-        torch.cuda.empty_cache()
-
         intensity_cube = source_img_cube.unsqueeze(-1)
-        del source_img_cube
-        torch.cuda.empty_cache()
-        sig_sq = (line_broadening/3.086e13/self.numerical_stability)**2
+        sig_sq = line_broadening**2
         kde_dist = (-1*(self.cube_z_l_keops - (v_los_keops + v_offset_pc))**2 / sig_sq).exp()
         cube = (kde_dist @ intensity_cube) * (1/torch.sqrt(2*self.pi*sig_sq))
         cube_final = torch.squeeze(cube)
-        del cube
-        torch.cuda.empty_cache()
 
         cube_final_3D = cube_final.permute(2, 0, 1)  # (velocity_res, image_res, image_res)
-        del cube_final
-        torch.cuda.empty_cache()
-        
+
         # Expand to (N=1, C=1, D, H, W)
         cube_5d = cube_final_3D.unsqueeze(0).unsqueeze(0)
-        del cube_final_3D
-        torch.cuda.empty_cache()
 
         # Compute integer pooling sizes (assumes integral ratios)
         kernel_d = self.velocity_upscale
@@ -138,8 +119,6 @@ class CubeSimulator(Module):
             kernel_size=(kernel_d, kernel_h, kernel_w),
             stride=(kernel_d, kernel_h, kernel_w)
         )
-        del cube_5d
-        torch.cuda.empty_cache()
         # Shape => (1, 1, velocity_res_out, image_res_out, image_res_out)
         cube_downsampled = cube_downsampled.squeeze(0).squeeze(0)
 
@@ -150,6 +129,7 @@ class CubeSimulator(Module):
         #cube_downsampled *= scale_factor
         torch.cuda.empty_cache()
         return cube_downsampled
+
 
 class CubePosition(Module):
     """

@@ -7,6 +7,14 @@ from pykeops.torch import LazyTensor
 from torch.nn.functional import conv2d, avg_pool2d
 
 
+def _leggauss(n, dtype, device):
+    import numpy as np
+    from numpy.polynomial.legendre import leggauss
+    x, w = leggauss(n)
+    x_t = torch.tensor(x, dtype=dtype, device=device)
+    w_t = torch.tensor(w, dtype=dtype, device=device)
+    return x_t, w_t
+
 class MGEVelocity(Module):
     """
     This class handles MGE parameters
@@ -49,23 +57,10 @@ class MGEVelocity(Module):
         
         device = x.device
         # Compute q_j intrinsic axial ratios from qobs and inc
-        #inc_safe = torch.clamp(inc, 1e-3, np.pi - 1e-3)
-        print("Inc unsafe:")
-        print(inc)
-        eps = 1e-3
-        inc_safe = eps + (np.pi - 2*eps) * torch.sigmoid(inc)
-        print("Inc safe:")
-        print(inc_safe)
-        cos_inc = torch.cos(inc_safe)
-        sin_inc = torch.sin(inc_safe)
-        print("sin_inc:")
-        print(sin_inc)
-        print("(qobs**2 - cos_inc**2)")
-        print((qobs**2 - cos_inc**2))
-        q_j_arg = (qobs**2 - cos_inc**2) / sin_inc**2
-        q_j_arg = q_j_arg.clamp(min=1e-8)
-        q_j = torch.sqrt(q_j_arg)
-        print(q_j_arg)
+        cos_inc = torch.cos(inc)
+        sin_inc = torch.sin(inc)
+        q_j = torch.sqrt((qobs**2 - cos_inc**2) / sin_inc**2)
+        q_j = q_j.clamp(min=1e-3)
         
         # Compute total mass for each Gaussian
         # L_j = 2*pi*surf*sigma^2*qobs
