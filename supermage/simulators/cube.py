@@ -29,7 +29,7 @@ class CubeSimulator(Module):
     velocity_upscale : int
         Factor by which velocity_res_out is multiplied. High internal resolution needed to prevent aliasing (rec. 5x).
     velocity_min, velocity_max : float
-        Velocity range (in m/s).
+        Velocity range (in km/s).
     cube_fov_half : float
         Spatial extent of the cube (pc). Gives half length of one side.
     image_res_out : int
@@ -43,6 +43,7 @@ class CubeSimulator(Module):
         self.intensity_model = intensity_model
 
         self.inclination = Param("inclination", None)
+        self.velocity_model.inc = self.inclination
         self.sky_rot = Param("sky_rot", None)
         self.line_broadening = Param("line_broadening", None)
         self.velocity_offset = Param("velocity_offset", None)
@@ -62,8 +63,8 @@ class CubeSimulator(Module):
 
         # Velocity grid
         self.v_z = torch.zeros_like(meshgrid[0], device = "cuda")
-        velocity_min_pc = velocity_min / 3.086e16
-        velocity_max_pc = velocity_max / 3.086e16
+        velocity_min_pc = velocity_min
+        velocity_max_pc = velocity_max
         cube_z_labels = torch.linspace(velocity_min_pc, velocity_max_pc, self.velocity_res, device = "cuda")
         cube_z_labels = cube_z_labels * torch.ones((self.image_res, self.image_res, self.velocity_res), device = "cuda")
         self.cube_z_l_keops = LazyTensor(cube_z_labels.unsqueeze(-1).expand(self.image_res, self.image_res, self.velocity_res, 1)[:, :, :, None, :])
@@ -85,8 +86,6 @@ class CubeSimulator(Module):
         rot_x, rot_y, rot_z = DoRotation(self.img_x, self.img_y, self.img_z, inclination, sky_rot)
 
         v_abs = self.velocity_model.velocity(rot_x, rot_y, rot_z).nan_to_num(posinf=0, neginf=0)
-        # Convert offset to pc/s
-        v_offset_pc = velocity_offset / 3.086e16
         
         theta_rot = torch.atan2(rot_y, rot_x)
         v_x = -v_abs * torch.sin(theta_rot)
@@ -99,7 +98,7 @@ class CubeSimulator(Module):
 
         intensity_cube = source_img_cube.unsqueeze(-1)
         sig_sq = line_broadening**2
-        kde_dist = (-1*(self.cube_z_l_keops - (v_los_keops + v_offset_pc))**2 / sig_sq).exp()
+        kde_dist = (-1*(self.cube_z_l_keops - (v_los_keops + velocity_offset))**2 / sig_sq).exp()
         cube = (kde_dist @ intensity_cube) * (1/torch.sqrt(2*self.pi*sig_sq))
         cube_final = torch.squeeze(cube)
 

@@ -3,100 +3,146 @@ from torch import pi, sqrt
 from caskade import Module, forward, Param
 from caustics.light.base import Source
 import numpy as np
+from numpy.polynomial.legendre import leggauss
 from pykeops.torch import LazyTensor
 from torch.nn.functional import conv2d, avg_pool2d
 
 
-def _leggauss(n, dtype, device):
-    import numpy as np
-    from numpy.polynomial.legendre import leggauss
-    x, w = leggauss(n)
-    x_t = torch.tensor(x, dtype=dtype, device=device)
-    w_t = torch.tensor(w, dtype=dtype, device=device)
-    return x_t, w_t
+def leggauss_interval(n, t_low, t_high, device, dtype):
+    """
+    Return Gauss–Legendre nodes & weights mapped from [-1,1] -> [t_low, t_high].
+    """
+    x, w = leggauss(n)   # x in [-1,1], w for [-1,1]
+    
+    half_width = 0.5*(t_high - t_low)
+    mid        = 0.5*(t_high + t_low)
+    
+    x_mapped = half_width*(x) + mid       # in [t_low, t_high]
+    w_mapped = half_width*(w)            # scaled by the interval length
+    
+    x_mapped_t = torch.tensor(x_mapped, dtype=dtype, device=device)
+    w_mapped_t = torch.tensor(w_mapped, dtype=dtype, device=device)
+    return x_mapped_t, w_mapped_t
+
+
+def transform_DE(t):
+    """
+    Double-exponential transform:
+      u = exp((π/2) * sinh(t)),
+      du/dt = (π/2)*cosh(t)*u.
+    """
+    u = torch.exp((np.pi/2.0)*torch.sinh(t))
+    du_dt = (np.pi/2.0)*torch.cosh(t)*u
+    return u, du_dt
+
 
 class MGEVelocity(Module):
-    """
-    This class handles MGE parameters
-    and computes rotational velocities. It uses Param for all parameters.
-
-    Parameters
-    ----------
-    N_components : int
-        Number of Gaussian components in the MGE.
-    """
-
     def __init__(self, N_components: int):
-        super().__init__()
+        super().__init__("MGEVelocity")
         self.N_components = N_components
         
-        # Stellar dynamical parameters
-        self.surf = Param("surf", shape=(N_components,))
-        self.sigma = Param("sigma", shape=(N_components,))
-        self.qobs = Param("qobs", shape=(N_components,))
+        # Same parameter definitions
+        self.surf   = Param("surf",   shape=(N_components,))
+        self.sigma  = Param("sigma",  shape=(N_components,))
+        self.qobs   = Param("qobs",   shape=(N_components,))
         self.M_to_L = Param("M_to_L", shape=(N_components,))
         
-        # Scalar parameters
-        self.inc = Param("inc", None)   # inclination in radians
-        self.m_bh = Param("m_bh", None) # black hole mass
-        # If needed, you can also add x0, y0, pa, etc. as in MGE brightness if relevant.
+        self.inc   = Param("inc",   shape=())
+        self.m_bh  = Param("m_bh",  shape=())
 
     @forward
-    def velocity(self, x, y, z, surf, sigma, qobs, M_to_L, inc, m_bh):
+    def velocity(self, x, y, z,
+                 surf=None, sigma=None, qobs=None, M_to_L=None,
+                 inc=None, m_bh=None,
+                 G=0.004301,
+                 soft=0.0,
+                 quad_points=128):
         """
-        Compute the rotational velocity at points (x, y, z).
-        Parameters are automatically taken from the Param attributes.
-
-        * x, y, z: Coordinates (pc)
-        * surf, sigma, qobs: MGE parameters for each Gaussian
-        * M_to_L: Mass-to-light ratio for each Gaussian
-        * inc: Inclination angle
-        * m_bh: Black hole mass
+        Compute the rotational velocity at points (x, y, z), but use a
+        double-exponential transform from [0,1] -> (0,∞).
         """
-        G = 4.517103e-30  # pc^3 / (M_star * s^2)
-        
         device = x.device
-        # Compute q_j intrinsic axial ratios from qobs and inc
+        dtype  = x.dtype
+        
+        # --- geometry & mass density the same as your original ---
         cos_inc = torch.cos(inc)
         sin_inc = torch.sin(inc)
-        q_j = torch.sqrt((qobs**2 - cos_inc**2) / sin_inc**2)
-        q_j = q_j.clamp(min=1e-3)
+        q_arg = qobs**2 - cos_inc**2
+        if torch.any(q_arg <= 0.0):
+            raise ValueError("Inclination too low for deprojection")
+        q_intr = torch.sqrt(q_arg) / sin_inc
         
-        # Compute total mass for each Gaussian
-        # L_j = 2*pi*surf*sigma^2*qobs
-        L_j = 2 * pi * surf * sigma**2 * qobs
-        M_j = M_to_L * L_j
+        sqrt_2pi = np.sqrt(2.0*np.pi)
+        mass_density = surf * M_to_L * qobs / (q_intr * sigma * sqrt_2pi)
         
-        # Flatten coordinates
         x_flat = x.flatten()
         y_flat = y.flatten()
         z_flat = z.flatten()
+        R_flat = torch.sqrt(x_flat**2 + y_flat**2 + z_flat**2)
+        N_points = R_flat.shape[0]
         
-        R_flat = torch.sqrt(x_flat**2 + y_flat**2)
+        # Scale by median sigma
+        scale = sigma.quantile(q = 0.5)
+        sigma_sc = sigma / scale
+        R_sc = R_flat / scale
+        soft_sc = soft / scale
+
+        mds = sigma_sc.quantile(q = 0.5)
+        mxs = torch.max(sigma_sc)
+        xlim = torch.tensor([
+            torch.arcsinh(torch.log(1e-7 * mds)*2/np.pi),
+            torch.arcsinh(torch.log(1e3  * mxs)*2/np.pi)
+        ])
         
-        # Reshape for broadcasting
-        N = x_flat.shape[0]
-        R_flat = R_flat[:, None]  # [N,1]
-        sigma_j = sigma[None, :]  # [1,N_gauss]
-        q_j = q_j[None, :]        # [1,N_gauss]
-        M_j = M_j[None, :]        # [1,N_gauss]
+        # --- Gauss–Legendre on [0,1] ---
+        t_1d, w_1d = leggauss_interval(quad_points, xlim[0].item(), xlim[1].item(), device, dtype)
         
-        # Compute exponential terms
-        exp_term = torch.exp(-R_flat**2 / (2 * sigma_j**2))
+        # --- Double-exponential transform t->u in (0,∞) ---
+        u_1d, du_1d = transform_DE(t_1d)
         
-        # Compute radial force for each Gaussian
-        G_const = G / (sqrt(2*torch.tensor(pi, device = "cuda"))*sigma_j**3 * q_j)
-        F_R_j = G_const * M_j * R_flat * exp_term   # [N, N_gauss]
+        # KeOps LazyTensors for efficient computation
+        # Reshape for KeOps: [N,1] and [1,Q] formats
+        R_i = LazyTensor(R_sc.reshape(N_points, 1, 1))  # [N,1,1]
+        u_j = LazyTensor(u_1d.reshape(1, quad_points, 1))  # [1,Q,1]
+        w_j = LazyTensor(w_1d.reshape(1, quad_points, 1))  # [1,Q,1]
+        du_j = LazyTensor(du_1d.reshape(1, quad_points, 1))  # [1,Q,1]
+
+        # Initialize result tensor for accumulation
+        integral_val = torch.zeros(N_points, device=device, dtype=dtype)
         
-        F_R_total = F_R_j.sum(dim=1)  # [N]
+        # Process components one by one to avoid memory explosion
+        for comp_idx in range(self.N_components):
+            # Extract component parameters
+            sigma_c = sigma_sc[comp_idx]
+            q_intr_c = q_intr[comp_idx]
+            mass_den_c = mass_density[comp_idx]
+            
+            # Calculate with LazyTensors
+            one_plus_u = 1.0 + u_j
+            exponent = -0.5 * (R_i**2) / ((sigma_c**2) * one_plus_u)
+            exp_val = exponent.exp()
+            
+            denom = (one_plus_u**2) * (q_intr_c**2 + u_j).sqrt()
+            term = (q_intr_c * mass_den_c * exp_val) / denom
+            
+            # Weight by integration factors
+            weighted_term = term * du_j * w_j
+            
+            # Sum over quadrature points
+            comp_integral = weighted_term.sum(axis=1).squeeze()
+            
+            # Accumulate to the result
+            integral_val += comp_integral
         
-        # Add black hole force
-        epsilon = 1e-10
-        R_safe = R_flat.squeeze().clamp(min=epsilon)
-        F_R_BH = G * m_bh / R_safe**2
-        F_R_total += F_R_BH
+        # Multiply by the factor 2 pi G scale^2
+        vc2_mge_factor = 2.0 * np.pi * G * (scale**2)
+        vc2_mge = vc2_mge_factor * integral_val
         
-        v_rot_flat = torch.sqrt(R_safe * F_R_total)
-        v_rot = v_rot_flat.reshape(x.shape)
+        # Black hole contribution
+        vc2_bh = G * m_bh / scale * (R_sc**2 + soft_sc**2).pow(-1.5)
+        
+        # Final velocity
+        v_rot_flat = R_sc * torch.sqrt(vc2_mge + vc2_bh)
+        v_rot = v_rot_flat.reshape_as(x)
         
         return v_rot
