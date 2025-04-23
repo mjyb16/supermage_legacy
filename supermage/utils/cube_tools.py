@@ -5,7 +5,9 @@ from supermage.utils.coord_utils import e_radius, pixel_size_background
 import matplotlib.pyplot as plt
 from astropy import constants as const
 from scipy import signal
+from scipy import ndimage
 from scipy.ndimage import uniform_filter
+from scipy.ndimage import rotate
 
 # Speed of light in m/s
 c = const.c.value  
@@ -77,3 +79,26 @@ def velocity_map(cube, velocities):
     vel_map = np.sum(cube * velocities[None, None, :], axis=2) / np.sum(cube, axis=2)
     
     return vel_map
+
+def rotate_spectral_cube(cube, angle):
+    """
+    Rotate a spectral image cube by a specific angle.
+    
+    Parameters:
+    cube (numpy.ndarray): The spectral image cube with shape (channels, height, width)
+    angle (float): The rotation angle in degrees
+    
+    Returns:
+    numpy.ndarray: The rotated spectral image cube
+    """
+    # Get the dimensions of the cube
+    channels, height, width = cube.shape
+    
+    # Create an empty array to store the rotated cube
+    rotated_cube = np.zeros_like(cube)
+    
+    # Rotate each channel
+    for i in range(channels):
+        rotated_cube[i] = ndimage.rotate(cube[i], angle, reshape=False, mode='wrap', cval=0.0)
+    
+    return rotated_cube
