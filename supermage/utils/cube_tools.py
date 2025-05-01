@@ -63,8 +63,8 @@ def freq_to_vel_systemic(freq, systemic_velocity, line = "co21"):
     given an array of frequencies (in Hz).
     """
     if line == "co21":
-        blueshifted_co21_freq = co21_rest_freq / (1 + systemic_velocity / c)
-        velocities = c * (co21_rest_freq / freq - 1) - systemic_velocity
+        blueshifted_co21_freq = co21_rest_freq * (1 - systemic_velocity / c)
+        velocities = c * (1 - freq / co21_rest_freq) - systemic_velocity
         return velocities, blueshifted_co21_freq
 
 def velocity_map_torch(cube, velocities):      
