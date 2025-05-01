@@ -37,7 +37,7 @@ def transform_DE(t):
 
 
 class MGEVelocity(Module):
-    def __init__(self, N_components: int):
+    def __init__(self, N_components: int, variable_M_to_L = False):
         super().__init__("MGEVelocity")
         self.N_components = N_components
         
@@ -45,7 +45,10 @@ class MGEVelocity(Module):
         self.surf   = Param("surf",   shape=(N_components,))
         self.sigma  = Param("sigma",  shape=(N_components,))
         self.qobs   = Param("qobs",   shape=(N_components,))
-        self.M_to_L = Param("M_to_L", shape=(N_components,))
+        if variable_M_to_L:
+            self.M_to_L = Param("M_to_L", shape=(N_components,))
+        else:
+            self.M_to_L = Param("M_to_L", shape=())
         
         self.inc   = Param("inc",   shape=())
         self.m_bh  = Param("m_bh",  shape=())
