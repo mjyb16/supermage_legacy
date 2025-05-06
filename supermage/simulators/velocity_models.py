@@ -142,7 +142,7 @@ class MGEVelocity(Module):
         vc2_mge = vc2_mge_factor * integral_val
         
         # Black hole contribution
-        vc2_bh = G * m_bh / scale * (R_sc**2 + soft_sc**2).pow(-1.5)
+        vc2_bh = G * 10**m_bh / scale * (R_sc**2 + soft_sc**2).pow(-1.5)
         
         # Final velocity
         v_rot_flat = R_sc * torch.sqrt(vc2_mge + vc2_bh)

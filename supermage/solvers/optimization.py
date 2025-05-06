@@ -76,7 +76,21 @@ def lm_cg(
             L = min(L * L_up, L_max)
 
         if verbose:
-            print(f"{it:4d} | {chi2.item():12.4e} | {chi2_new.item():12.4e} | {L:8.2e} | {rho.item():6.3f} | {str(accepted):>4} M_bh : {X[2]}")
+            i = 2
+            D = X.numel()
+
+            # build a basis vector e_i
+            e_i = torch.zeros(D, device=X.device, dtype=X.dtype)
+            e_i[i] = 1.0
+            
+            # apply your hvp to get (H + L·I)·e_i
+            Hi_plus_L = hvp(e_i)[i].item()
+            
+            # subtract off the damping to get the true diagonal H_{ii}
+            H_ii = Hi_plus_L - L
+            
+            print(f"param[{i}]: grad={grad[i].item():.3e}, H_ii={H_ii:.3e}, L={L:.3e}")
+            print(f"{it:4d} | {chi2.item():12.4e} | {chi2_new.item():12.4e} | {L:8.2e} | {rho.item():6.3f} | {str(accepted):>4} M_bh : {X[2]}, {h[2]}, \n {h}")
 
         if torch.norm(h) < stopping:
             break
@@ -85,3 +99,4 @@ def lm_cg(
         _, grad = chi2_and_grad(X)
 
     return X, L, chi2
+
