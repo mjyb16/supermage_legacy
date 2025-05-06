@@ -63,6 +63,7 @@ class VisibilityCube(Module):
             return fft_result
 
         pb_results = torch.vmap(pb_cube)(cube, self.primary_beams)
+        #Access velocity shifter, freqs and recalculate velocities in order to get velocity channel width
         normed_result = flux*pb_results/pb_results.sum()
         fft_results = torch.vmap(fft_channel)(normed_result)
         # fft_results: shape (N_freq, Nx, Ny), dtype=complex64

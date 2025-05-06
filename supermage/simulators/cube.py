@@ -4,6 +4,7 @@ from math import pi
 from caskade import Module, forward, Param
 from pykeops.torch import LazyTensor
 from supermage.utils.math_utils import DoRotation, DoRotationT
+from supermage.utils.cube_tools import freq_to_vel_systemic
 import torch.nn.functional as F
 import caustics
 from caustics.light import Pixelated
@@ -24,7 +25,7 @@ class CubeSimulator(Module):
         SuperMAGE velocity field model
     intensity_model : Module
         SuperMAGE intensity/brightness field model
-    velocity_res_out : int
+    freqs : int
         Final (downsampled) number of pixels along velocity dimension.
     velocity_upscale : int
         Factor by which velocity_res_out is multiplied. High internal resolution needed to prevent aliasing (rec. 5x).
@@ -37,7 +38,7 @@ class CubeSimulator(Module):
     image_upscale : int
         Factor by which image_res_out is multiplied. High internal resolution can be needed to prevent aliasing.
     """
-    def __init__(self, velocity_model, intensity_model, velocity_res_out, velocity_upscale, velocity_min, velocity_max, cube_fov_half, image_res_out, image_upscale):
+    def __init__(self, velocity_model, intensity_model, freqs, systemic_or_redshift, frequency_upscale, cube_fov_half, image_res_out, image_upscale, line="co21"):
         super().__init__()
         self.velocity_model = velocity_model
         self.intensity_model = intensity_model
@@ -46,13 +47,18 @@ class CubeSimulator(Module):
         self.velocity_model.inc = self.inclination
         self.sky_rot = Param("sky_rot", None)
         self.line_broadening = Param("line_broadening", None)
-        self.velocity_offset = Param("velocity_offset", None)
+        self.velocity_shift = Param("velocity_shift", None)
         #self.flux = Param("flux", None)
 
+        # Determine whether we want systemic velocity or redshift
+        self.systemic_or_redshift = systemic_or_redshift
+        self.line = line
+        
         # Internal resolutions
-        self.velocity_res = velocity_res_out * velocity_upscale
+        self.freq_res_out = len(freqs)
+        self.frequency_res = self.freq_res_out * frequency_upscale
         self.image_res    = image_res_out * image_upscale
-        self.velocity_upscale = velocity_upscale
+        self.frequency_upscale = frequency_upscale
         self.image_upscale    = image_upscale
 
         # Image grid        
@@ -61,18 +67,21 @@ class CubeSimulator(Module):
         self.img_y = meshgrid[1]
         self.img_z = meshgrid[2]
 
-        # Velocity grid
+        # Frequency grid
+        self.freqs = freqs
         self.v_z = torch.zeros_like(meshgrid[0], device = "cuda")
-        velocity_min_pc = velocity_min
-        velocity_max_pc = velocity_max
-        cube_z_labels = torch.linspace(velocity_min_pc, velocity_max_pc, self.velocity_res, device = "cuda")
-        cube_z_labels = cube_z_labels * torch.ones((self.image_res, self.image_res, self.velocity_res), device = "cuda")
-        self.cube_z_l_keops = LazyTensor(cube_z_labels.unsqueeze(-1).expand(self.image_res, self.image_res, self.velocity_res, 1)[:, :, :, None, :])
+        #freq_first = freqs[0]
+        #freq_last = freqs[-1]
+        
+        self.freqs_upsampled = torch.linspace(self.freqs[0], self.freqs[-1], self.frequency_res, device = "cuda", dtype = torch.float32)
+        cube_z_labels = self.freqs_upsampled * torch.ones((self.image_res, self.image_res, self.frequency_res), device = "cuda", dtype = torch.float32)
+        self.cube_z_l_keops = LazyTensor(cube_z_labels.unsqueeze(-1).expand(self.image_res, self.image_res, self.frequency_res, 1)[:, :, :, None, :])
 
         # Output resolutions
-        self.velocity_res_out = velocity_res_out
+        # Freq_res_out defined in internal resolutions
         self.image_res_out = image_res_out
-        self.dv = (velocity_max_pc - velocity_min_pc) / self.velocity_res_out
+        #self.dv = (velocity_max_pc - velocity_min_pc) / self.velocity_res_out
+        #Calculate dv in the forward pass of visibility_cube model
         self.dx = self.dy = 2*cube_fov_half/image_res_out
 
         # Constants
@@ -81,7 +90,7 @@ class CubeSimulator(Module):
     @forward
     def forward(
         self,
-        inclination=None, sky_rot=None, line_broadening=None, velocity_offset = None
+        inclination=None, sky_rot=None, line_broadening=None, velocity_shift = None, 
     ):
         rot_x, rot_y, rot_z = DoRotation(self.img_x, self.img_y, self.img_z, inclination, sky_rot)
 
@@ -98,17 +107,25 @@ class CubeSimulator(Module):
 
         intensity_cube = source_img_cube.unsqueeze(-1)
         sig_sq = line_broadening**2
-        kde_dist = (-1*(self.cube_z_l_keops - (v_los_keops + velocity_offset))**2 / sig_sq).exp()
+        if self.systemic_or_redshift == "systemic":
+            velocity_labels, _ = freq_to_vel_systemic(self.cube_z_l_keops, velocity_shift, self.line)
+        elif self.systemic_or_redshift == "redshift":
+            print("Need to implement redshift")
+            return
+        else:
+            print("Please specify 'redshift' or 'systemic'")
+            return
+        kde_dist = (-1*(velocity_labels - v_los_keops)**2 / sig_sq).exp()
         cube = (kde_dist @ intensity_cube) * (1/torch.sqrt(2*self.pi*sig_sq))
         cube_final = torch.squeeze(cube)
 
-        cube_final_3D = cube_final.permute(2, 0, 1)  # (velocity_res, image_res, image_res)
+        cube_final_3D = cube_final.permute(2, 0, 1)  # (frequency_res, image_res, image_res)
 
         # Expand to (N=1, C=1, D, H, W)
         cube_5d = cube_final_3D.unsqueeze(0).unsqueeze(0)
 
         # Compute integer pooling sizes (assumes integral ratios)
-        kernel_d = self.velocity_upscale
+        kernel_d = self.frequency_upscale
         kernel_h = self.image_upscale
         kernel_w = self.image_upscale
 
@@ -118,7 +135,7 @@ class CubeSimulator(Module):
             kernel_size=(kernel_d, kernel_h, kernel_w),
             stride=(kernel_d, kernel_h, kernel_w)
         )
-        # Shape => (1, 1, velocity_res_out, image_res_out, image_res_out)
+        # Shape => (1, 1, frequency_res_out, image_res_out, image_res_out)
         cube_downsampled = cube_downsampled.squeeze(0).squeeze(0)
 
         #raw_sum = cube_downsampled.sum().item()  # just the sum of array entries
