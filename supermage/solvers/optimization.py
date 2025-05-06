@@ -76,7 +76,7 @@ def lm_cg(
             L = min(L * L_up, L_max)
 
         if verbose:
-            print(f"{it:4d} | {chi2.item():12.4e} | {chi2_new.item():12.4e} | {L:8.2e} | {rho.item():6.3f} | {str(accepted):>4}")
+            print(f"{it:4d} | {chi2.item():12.4e} | {chi2_new.item():12.4e} | {L:8.2e} | {rho.item():6.3f} | {str(accepted):>4} M_bh : {X[2]}")
 
         if torch.norm(h) < stopping:
             break
