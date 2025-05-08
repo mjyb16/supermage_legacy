@@ -14,8 +14,7 @@ class VisibilityCube(Module):
         freqs, 
         npix,
         pixelscale,
-        dish_diameter=12,  
-        device="cuda"
+        dish_diameter=12
     ):
         super().__init__()
         self.cube_simulator = cube_simulator
@@ -28,7 +27,7 @@ class VisibilityCube(Module):
         self.npix = npix
         self.pixelscale = pixelscale
         self.flux = Param("flux", None)
-        self.device = device
+        self.device = cube_simulator.device
 
         #pixelscale_rad = self.pixelscale * (np.pi / 180.0) / 3600.0  # arcsec -> radians
         #self.pixel_area_sr = pixelscale_rad**2
@@ -41,7 +40,7 @@ class VisibilityCube(Module):
                 freq=freq,
                 shape=(npix, npix),
                 deltal=pixelscale,
-                device=device
+                device=self.device
             )
             pbs.append(pb)
         self.primary_beams = torch.stack(pbs, dim=0)  # shape (N_freq, Nx, Ny)
@@ -63,16 +62,18 @@ class VisibilityCube(Module):
             return fft_result
 
         pb_results = torch.vmap(pb_cube)(cube, self.primary_beams)
+        del cube
+        torch.cuda.empty_cache()
         #Access velocity shifter, freqs and recalculate velocities in order to get velocity channel width
         normed_result = flux*pb_results/pb_results.sum()
         fft_results = torch.vmap(fft_channel)(normed_result)
+        del normed_result
+        torch.cuda.empty_cache()
         # fft_results: shape (N_freq, Nx, Ny), dtype=complex64
     
         if plot:
             # Simply multiply by the mask (broadcasting if needed)
             mask_f = self.mask.float()  # shape (N_chan, Nx, Ny)
-            del cube
-            torch.cuda.empty_cache()
             return fft_results * mask_f
         else:
             # We want only the masked values. Let's define a small helper 
@@ -87,6 +88,4 @@ class VisibilityCube(Module):
             # This will return shape (N_chan, #Trues) if each channel has the same #Trues
             visibilities_result = torch.vmap(gather_masked)(fft_results, self.mask)
             # shape: (N_chan, #Trues)
-            del cube
-            torch.cuda.empty_cache()
             return visibilities_result

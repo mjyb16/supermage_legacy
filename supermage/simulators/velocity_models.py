@@ -64,6 +64,7 @@ class MGEVelocity(Module):
         Compute the rotational velocity at points (x, y, z), but use a
         double-exponential transform from [0,1] -> (0,∞).
         """
+        print()
         device = x.device
         dtype  = x.dtype
         

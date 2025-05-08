@@ -1,7 +1,7 @@
 import torch
 
 def _func_R_x(theta, device = "cuda"):
-    result = torch.zeros((3, 3), device = device)
+    result = torch.zeros((3, 3), device = device, dtype = torch.float64)
     result[0, 0] = 1
     result[1, 1] = torch.cos(theta)
     result[1, 2] = -torch.sin(theta)
@@ -10,7 +10,7 @@ def _func_R_x(theta, device = "cuda"):
     return result
 
 def _func_R_y(psi, device = "cuda"):
-    result = torch.zeros((3, 3), device = device)
+    result = torch.zeros((3, 3), device = device, dtype = torch.float64)
     result[0, 0] = torch.cos(psi)
     result[0, 2] = torch.sin(psi)
     result[1, 1] = 1
@@ -19,7 +19,7 @@ def _func_R_y(psi, device = "cuda"):
     return result
 
 def _func_R_z(phi, device = "cuda"):
-    result = torch.zeros((3, 3), device = device)
+    result = torch.zeros((3, 3), device = device, dtype = torch.float64)
     result[0, 0] = torch.cos(phi)
     result[0, 1] = -torch.sin(phi)
     result[1, 0] = torch.sin(phi)
@@ -47,8 +47,7 @@ def DoRotationT(x, y, z, theta, phi, device = "cuda"):
     # Clockwise, 2D rotation matrix
     RotMatrix = torch.matmul(_func_R_y(theta, device = device), _func_R_z(phi, device = device)).T
     #return torch.einsum('ji, mni -> jmn', RotMatrix, torch.dstack([x, y, z]))
-    ### NEED TO UNDERSTAND WHERE NEED TO CONVERT TO FLOAT PRECISION IS COMING FROM (WHY IS X DOUBLE)
-    mult = torch.inner(RotMatrix, torch.dstack([x.ravel(),y.ravel(), z.ravel()]).float())
+    mult = torch.inner(RotMatrix, torch.dstack([x.ravel(),y.ravel(), z.ravel()]))
     xrot = mult[0,:].reshape(shape)
     yrot = mult[1,:].reshape(shape)
     zrot = mult[2,:].reshape(shape)

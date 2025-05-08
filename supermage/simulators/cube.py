@@ -4,18 +4,19 @@ from math import pi
 from caskade import Module, forward, Param
 from pykeops.torch import LazyTensor
 from supermage.utils.math_utils import DoRotation, DoRotationT
-from supermage.utils.cube_tools import freq_to_vel_systemic
+from supermage.utils.cube_tools import freq_to_vel_systemic_torch
 import torch.nn.functional as F
 import caustics
 from caustics.light import Pixelated
 from torch.nn.functional import avg_pool2d, conv2d
+import numpy as np
 
 def generate_meshgrid(grid_extent, gal_res, device = "cuda"):
     """
     Generates grid for simulation
     grid_extent: 2*r_galaxy usually
     """
-    return torch.meshgrid(torch.linspace(-grid_extent, grid_extent, gal_res, device = device), torch.linspace(-grid_extent, grid_extent, gal_res, device = device), torch.linspace(-grid_extent, grid_extent, gal_res, device = device), indexing = "ij")
+    return torch.meshgrid(torch.linspace(-grid_extent, grid_extent, gal_res, device = device, dtype = torch.float64), torch.linspace(-grid_extent, grid_extent, gal_res, device = device, dtype = torch.float64), torch.linspace(-grid_extent, grid_extent, gal_res, device = device, dtype = torch.float64), indexing = "ij")
 
 class CubeSimulator(Module):
     """
@@ -38,8 +39,9 @@ class CubeSimulator(Module):
     image_upscale : int
         Factor by which image_res_out is multiplied. High internal resolution can be needed to prevent aliasing.
     """
-    def __init__(self, velocity_model, intensity_model, freqs, systemic_or_redshift, frequency_upscale, cube_fov_half, image_res_out, image_upscale, line="co21"):
+    def __init__(self, velocity_model, intensity_model, freqs, systemic_or_redshift, frequency_upscale, cube_fov_half, image_res_out, image_upscale, line="co21", device = "cuda"):
         super().__init__()
+        self.device = device
         self.velocity_model = velocity_model
         self.intensity_model = intensity_model
 
@@ -62,19 +64,19 @@ class CubeSimulator(Module):
         self.image_upscale    = image_upscale
 
         # Image grid        
-        meshgrid = generate_meshgrid(cube_fov_half, self.image_res, device="cuda")
+        meshgrid = generate_meshgrid(cube_fov_half, self.image_res, device=self.device)
         self.img_x = meshgrid[0]
         self.img_y = meshgrid[1]
         self.img_z = meshgrid[2]
 
         # Frequency grid
         self.freqs = freqs
-        self.v_z = torch.zeros_like(meshgrid[0], device = "cuda")
+        self.v_z = torch.zeros_like(meshgrid[0], device = self.device)
         #freq_first = freqs[0]
         #freq_last = freqs[-1]
         
-        self.freqs_upsampled = torch.linspace(self.freqs[0], self.freqs[-1], self.frequency_res, device = "cuda", dtype = torch.float32)
-        cube_z_labels = self.freqs_upsampled * torch.ones((self.image_res, self.image_res, self.frequency_res), device = "cuda", dtype = torch.float32)
+        self.freqs_upsampled = torch.linspace(self.freqs[0], self.freqs[-1], self.frequency_res, device = self.device, dtype = torch.float64)
+        cube_z_labels = self.freqs_upsampled * torch.ones((self.image_res, self.image_res, self.frequency_res), device = self.device, dtype = torch.float64)
         self.cube_z_l_keops = LazyTensor(cube_z_labels.unsqueeze(-1).expand(self.image_res, self.image_res, self.frequency_res, 1)[:, :, :, None, :])
 
         # Output resolutions
@@ -83,16 +85,16 @@ class CubeSimulator(Module):
         #self.dv = (velocity_max_pc - velocity_min_pc) / self.velocity_res_out
         #Calculate dv in the forward pass of visibility_cube model
         self.dx = self.dy = 2*cube_fov_half/image_res_out
-
+        
         # Constants
-        self.pi = torch.tensor(pi, device = "cuda")
+        self.pi = torch.tensor(pi, device = self.device)
 
     @forward
     def forward(
         self,
         inclination=None, sky_rot=None, line_broadening=None, velocity_shift = None, 
     ):
-        rot_x, rot_y, rot_z = DoRotation(self.img_x, self.img_y, self.img_z, inclination, sky_rot)
+        rot_x, rot_y, rot_z = DoRotation(self.img_x, self.img_y, self.img_z, inclination, sky_rot, device = self.device)
 
         v_abs = self.velocity_model.velocity(rot_x, rot_y, rot_z).nan_to_num(posinf=0, neginf=0)
         
@@ -100,7 +102,7 @@ class CubeSimulator(Module):
         v_x = -v_abs * torch.sin(theta_rot)
         v_y = v_abs * torch.cos(theta_rot)
 
-        v_x_r, v_y_r, v_z_r = DoRotationT(v_x, v_y, self.v_z, inclination, sky_rot)
+        v_x_r, v_y_r, v_z_r = DoRotationT(v_x, v_y, self.v_z, inclination, sky_rot, device = self.device)
         v_los_keops = LazyTensor(v_z_r.unsqueeze(-1).expand(self.image_res, self.image_res, self.image_res, 1)[:, :, None, :, :])
 
         source_img_cube = self.intensity_model.brightness(rot_x, rot_y, rot_z)
@@ -108,7 +110,7 @@ class CubeSimulator(Module):
         intensity_cube = source_img_cube.unsqueeze(-1)
         sig_sq = line_broadening**2
         if self.systemic_or_redshift == "systemic":
-            velocity_labels, _ = freq_to_vel_systemic(self.cube_z_l_keops, velocity_shift, self.line)
+            velocity_labels, _ = freq_to_vel_systemic_torch(self.cube_z_l_keops, velocity_shift, self.line, device = self.device)
         elif self.systemic_or_redshift == "redshift":
             print("Need to implement redshift")
             return
@@ -173,6 +175,7 @@ class CubePosition(Module):
         super().__init__(name)
         
         self.source_cube = source_cube
+        self.device = source_cube.device
         self.upsample_factor = upsample_factor
         self.src = Pixelated(name="source", shape=(pixels_x_source, pixels_x_source), pixelscale=pixelscale_source, image = torch.zeros((pixels_x_source, pixels_x_source)))
 
@@ -180,7 +183,7 @@ class CubePosition(Module):
         thx, thy = caustics.utils.meshgrid(
             pixelscale_lens / upsample_factor,
             upsample_factor * pixels_x_lens,
-            dtype=torch.float32, device = "cuda"
+            dtype=torch.float64, device = source_cube.device
         )
 
         self.thx = thx

@@ -108,20 +108,19 @@ def gaussian_pb(diameter=12, freq=432058061289.4426, shape=(500, 500), deltal=0.
     half_fov = deltal * shape[0] / 2
 
     # Grid for PB
-    x = torch.linspace(-half_fov, half_fov, shape[0], device=device)
-    y = torch.linspace(-half_fov, half_fov, shape[1], device=device)
+    x = torch.linspace(-half_fov, half_fov, shape[0], device=device, dtype = torch.float64)
+    y = torch.linspace(-half_fov, half_fov, shape[1], device=device, dtype = torch.float64)
     x, y = torch.meshgrid(x, y, indexing='xy')
 
     # Gaussian PB parameters
-    mean = torch.tensor([0.0, 0.0], device=device)  # Mean (center) of the Gaussian
+    mean = torch.tensor([0.0, 0.0], device=device, dtype = torch.float64)  # Mean (center) of the Gaussian
     std = fwhm / (2 * torch.sqrt(2 * torch.log(torch.tensor(2.0, device=device))))
-    covariance_matrix = torch.tensor([[std**2, 0], [0, std**2]], device=device)  # Covariance matrix
+    covariance_matrix = torch.tensor([[std**2, 0], [0, std**2]], device=device, dtype = torch.float64)  # Covariance matrix
 
     # 2-D Gaussian PB
     x_y = torch.stack([x.ravel(), y.ravel()], dim=1)
     inv_covariance_matrix = torch.inverse(covariance_matrix)
     diff = x_y - mean
-
     pb = (
         1 / (2 * torch.pi * torch.sqrt(torch.det(covariance_matrix)))
     ) * torch.exp(-0.5 * torch.sum(diff @ inv_covariance_matrix * diff, dim=1))

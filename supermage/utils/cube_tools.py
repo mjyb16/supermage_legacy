@@ -9,10 +9,6 @@ from scipy import ndimage
 from scipy.ndimage import uniform_filter
 from scipy.ndimage import rotate
 
-# Speed of light in km/s
-c = torch.tensor(const.c.astype("float32").value, dtype = torch.float32, device = "cuda")/1e3
-# Rest frequency of the CO(2-1) line in Hz
-co21_rest_freq = torch.tensor(230.538e9, dtype = torch.float32, device = "cuda")
 
 def dirty_cube_tool(vis_bin_re_cube, vis_bin_imag_cube, roi_start, roi_end):
     # Define the region of interest for the cube (pixels 1000 to 1050)
@@ -60,8 +56,26 @@ def smooth_mask(cube, sigma = 2, hann = 5, clip = 0.0002):  # updated by Eric
 def freq_to_vel_systemic(freq, systemic_velocity, line = "co21"):
     """
     Return velocity offsets (in km/s) relative to a systemic velocity (in km/s)
-    given an array of frequencies (in Hz).
+    given an array of frequencies (in GHz).
     """
+    # Speed of light in km/s
+    c = const.c.value/1e3
+    # Rest frequency of the CO(2-1) line in Hz
+    co21_rest_freq = 230.538
+    if line == "co21":
+        blueshifted_co21_freq = co21_rest_freq * (1 - systemic_velocity / c)
+        velocities = c * (1 - freq / co21_rest_freq) - systemic_velocity
+        return velocities, blueshifted_co21_freq
+
+def freq_to_vel_systemic_torch(freq, systemic_velocity, line = "co21", device = "cuda"):
+    """
+    Return velocity offsets (in km/s) relative to a systemic velocity (in km/s)
+    given an array of frequencies (in GHz).
+    """
+    # Speed of light in km/s
+    c = torch.tensor(const.c.value, dtype = torch.float64, device = device)/1e3
+    # Rest frequency of the CO(2-1) line in Hz
+    co21_rest_freq = torch.tensor(230.538, dtype = torch.float64, device = device)
     if line == "co21":
         blueshifted_co21_freq = co21_rest_freq * (1 - systemic_velocity / c)
         velocities = c * (1 - freq / co21_rest_freq) - systemic_velocity
