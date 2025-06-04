@@ -4,7 +4,7 @@ from math import pi
 from caskade import Module, forward, Param
 from pykeops.torch import LazyTensor
 from supermage.utils.math_utils import DoRotation, DoRotationT
-from supermage.utils.cube_tools import freq_to_vel_systemic_torch
+from supermage.utils.cube_tools import freq_to_vel_systemic_torch, freq_to_vel_absolute_torch
 import torch.nn.functional as F
 import caustics
 from caustics.light import Pixelated
@@ -75,7 +75,10 @@ class CubeSimulator(Module):
         #freq_first = freqs[0]
         #freq_last = freqs[-1]
         
-        self.freqs_upsampled = torch.linspace(self.freqs[0], self.freqs[-1], self.frequency_res, device = self.device, dtype = torch.float64)
+        #self.freqs_upsampled = torch.linspace(self.freqs[0], self.freqs[-1], self.frequency_res, device = self.device, dtype = torch.float64)
+        df = (self.freqs[-1] - self.freqs[0]) / (self.frequency_res - 1)
+        self.freqs_upsampled = self.freqs[0] + df * (torch.arange(self.frequency_res, device=self.device, dtype=torch.float64) - (0.5*self.frequency_upscale))
+        
         cube_z_labels = self.freqs_upsampled * torch.ones((self.image_res, self.image_res, self.frequency_res), device = self.device, dtype = torch.float64)
         self.cube_z_l_keops = LazyTensor(cube_z_labels.unsqueeze(-1).expand(self.image_res, self.image_res, self.frequency_res, 1)[:, :, :, None, :])
 
@@ -110,14 +113,14 @@ class CubeSimulator(Module):
         intensity_cube = source_img_cube.unsqueeze(-1)
         sig_sq = line_broadening**2
         if self.systemic_or_redshift == "systemic":
-            velocity_labels, _ = freq_to_vel_systemic_torch(self.cube_z_l_keops, velocity_shift, self.line, device = self.device)
+            velocity_labels, _ = freq_to_vel_absolute_torch(self.cube_z_l_keops, self.line, device = self.device)#velocity_shift, self.line, device = self.device)
         elif self.systemic_or_redshift == "redshift":
             print("Need to implement redshift")
             return
         else:
             print("Please specify 'redshift' or 'systemic'")
             return
-        kde_dist = (-1*(velocity_labels - v_los_keops)**2 / sig_sq).exp()
+        kde_dist = (-1*(velocity_labels - (v_los_keops + velocity_shift))**2 / sig_sq).exp()
         cube = (kde_dist @ intensity_cube) * (1/torch.sqrt(2*self.pi*sig_sq))
         cube_final = torch.squeeze(cube)
 

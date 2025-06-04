@@ -81,6 +81,12 @@ def freq_to_vel_systemic_torch(freq, systemic_velocity, line = "co21", device = 
         velocities = c * (1 - freq / co21_rest_freq) - systemic_velocity
         return velocities, blueshifted_co21_freq
 
+def freq_to_vel_absolute_torch(freq, line="co21", device="cuda"):
+    c = torch.tensor(const.c.value, dtype=torch.float64, device=device) / 1e3
+    co21_rest_freq = torch.tensor(230.538, dtype=torch.float64, device=device)
+    velocities = c * (1 - freq / co21_rest_freq)
+    return velocities, co21_rest_freq
+
 def velocity_map_torch(cube, velocities):      
     # Calculate intensity-weighted average velocity
     vel_map = torch.sum(cube * velocities[None, None, :], dim=2) / torch.sum(cube, dim=2)
