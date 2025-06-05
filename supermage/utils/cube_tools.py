@@ -1,5 +1,7 @@
 import numpy as np
+import math
 import torch
+import torch.nn.functional as F
 from torch.nn.functional import avg_pool2d
 from supermage.utils.coord_utils import e_radius, pixel_size_background
 import matplotlib.pyplot as plt
@@ -122,3 +124,47 @@ def rotate_spectral_cube(cube, angle):
         rotated_cube[i] = ndimage.rotate(cube[i], angle, reshape=False, mode='wrap', cval=0.0)
     
     return rotated_cube
+
+def make_elliptical_gaussian_kernel(bmaj_arcsec, bmin_arcsec, bpa_deg, pixel_scale_arcsec, size_factor=6.0):
+    """
+    Create 2D elliptical Gaussian kernel using NumPy, returns a torch tensor.
+    """
+    # Convert FWHM to sigma in pixel units
+    sigma_x = bmaj_arcsec / pixel_scale_arcsec / 2.355
+    sigma_y = bmin_arcsec / pixel_scale_arcsec / 2.355
+    theta = np.deg2rad(bpa_deg)
+
+    # Determine kernel size (odd)
+    size_x = int(size_factor * sigma_x) | 1
+    size_y = int(size_factor * sigma_y) | 1
+    x = np.arange(size_x) - size_x // 2
+    y = np.arange(size_y) - size_y // 2
+    X, Y = np.meshgrid(x, y, indexing='ij')
+
+    # Rotate coordinates
+    X_rot = X * np.cos(theta) + Y * np.sin(theta)
+    Y_rot = -X * np.sin(theta) + Y * np.cos(theta)
+
+    # 2D elliptical Gaussian
+    kernel = np.exp(-0.5 * ((X_rot / sigma_x) ** 2 + (Y_rot / sigma_y) ** 2))
+    kernel /= np.sum(kernel)
+
+    return torch.tensor(kernel, dtype=torch.float32)
+
+def convolve_cube_with_beam(cube, kernel):
+    """
+    Convolve spatial dimensions of a 3D cube with the given 2D kernel.
+    cube: torch.Tensor of shape [H, W, V]
+    kernel: 2D torch.Tensor
+    Returns a cube of the same shape.
+    """
+    H, W, V = cube.shape
+    cube = cube.permute(2, 0, 1).unsqueeze(1)  # [V, 1, H, W]
+    kernel = kernel.to(cube.device).unsqueeze(0).unsqueeze(0)  # [1, 1, h, w]
+    
+    # Ensure symmetric padding
+    pad_h = kernel.shape[-2] // 2
+    pad_w = kernel.shape[-1] // 2
+
+    cube_conv = F.conv2d(cube, kernel, padding=(pad_h, pad_w), groups=1)
+    return cube_conv.squeeze(1).permute(1, 2, 0)  # Back to [H, W, V]
