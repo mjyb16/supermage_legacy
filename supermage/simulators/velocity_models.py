@@ -188,8 +188,6 @@ class Nuker_MGE(Module):
         
         surf = NN_output*I_b
         MGE_sigma = self.sigma*r_b
-        print(surf.mean().cpu())
-        print(MGE_sigma.mean().cpu())
         v_rot = self.MGE.velocity(x, y, z, surf = surf, sigma = MGE_sigma, qobs = qobs, G = G, soft = soft, quad_points = quad_points)
         return v_rot
 
