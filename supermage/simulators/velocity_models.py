@@ -64,7 +64,6 @@ class MGEVelocity(Module):
         Compute the rotational velocity at points (x, y, z), but use a
         double-exponential transform from [0,1] -> (0,∞).
         """
-        print()
         device = x.device
         dtype  = x.dtype
         
@@ -150,3 +149,52 @@ class MGEVelocity(Module):
         v_rot = v_rot_flat.reshape_as(x)
         
         return v_rot
+
+class Nuker_MGE(Module):
+    def __init__(self, N_MGE_components: int, Nuker_NN, sigma_grid):
+        super().__init__("MGEVelocity")
+        self.N_components = N_MGE_components
+        self.MGE = MGEVelocity(self.N_components)
+        self.NN = Nuker_NN
+        self.sigma = sigma_grid
+        
+        self.inc   = Param("inc",   shape=())
+        self.m_bh  = Param("m_bh",  shape=())
+
+        self.q   = Param("qobs",   shape=())
+
+        self.alpha = Param("alpha", shape=())
+        self.beta = Param("beta", shape=())
+        self.gamma = Param("gamma", shape=())
+        self.r_b = Param("break_r", shape = ())
+        self.I_b = Param("intensity_r_b", shape = ())
+
+    @forward
+    def velocity(self, x, y, z,
+                 inc=None, m_bh=None, q = None,
+                 alpha = None, beta = None, gamma = None, r_b = None, I_b = None,
+                 G=0.004301,
+                 soft=0.0,
+                 quad_points=128):
+        device = x.device
+        dtype  = x.dtype
+
+        qobs = q*torch.ones(self.N_components)
+        self.MGE.qobs = qobs
+        self.MGE.inc = inc
+        self.MGE.m_bh = m_bh
+
+        NN_input = torch.cat([alpha, gamma, beta])
+        NN_output = self.NN.forward(NN_input)
+        
+        self.MGE.surf = NN_output*I_b
+        self.MGE.sigma = self.sigma*r_b
+        
+        v_rot = self.MGE.velocity(x, y, z)
+        return v_rot
+
+
+
+
+
+
