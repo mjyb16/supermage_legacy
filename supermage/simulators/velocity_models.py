@@ -109,33 +109,23 @@ class MGEVelocity(Module):
         u_j = LazyTensor(u_1d.reshape(1, quad_points, 1))  # [1,Q,1]
         w_j = LazyTensor(w_1d.reshape(1, quad_points, 1))  # [1,Q,1]
         du_j = LazyTensor(du_1d.reshape(1, quad_points, 1))  # [1,Q,1]
+        # (1) pack all Gaussian parameters in one vector of shape (C,)
+        sigma_vec     = LazyTensor(sigma_sc.view(1, 1, -1))      # (1,1,C)
+        q_intr_vec    = LazyTensor(q_intr.view(1, 1, -1))
+        mass_den_vec  = LazyTensor(mass_density.view(1, 1, -1))
 
-        # Initialize result tensor for accumulation
-        integral_val = torch.zeros(N_points, device=device, dtype=dtype)
+
+        one_plus     = 1 + u_j
+        exponent     = -0.5 * R_i**2 / (sigma_vec**2 * one_plus)
+        exp_val      = exponent.exp()
+        denom        = one_plus**2 * (q_intr_vec**2 + u_j).sqrt()
         
-        # Process components one by one to avoid memory explosion
-        for comp_idx in range(self.N_components):
-            # Extract component parameters
-            sigma_c = sigma_sc[comp_idx]
-            q_intr_c = q_intr[comp_idx]
-            mass_den_c = mass_density[comp_idx]
+        term         = (q_intr_vec * mass_den_vec * exp_val) / denom
+        weighted     = term * du_j * w_j
+        
+        # First reduce on the quadrature index j, then on the component index m
+        integral_val = weighted.sum(axis=1).sum(axis=1).squeeze()
             
-            # Calculate with LazyTensors
-            one_plus_u = 1.0 + u_j
-            exponent = -0.5 * (R_i**2) / ((sigma_c**2) * one_plus_u)
-            exp_val = exponent.exp()
-            
-            denom = (one_plus_u**2) * (q_intr_c**2 + u_j).sqrt()
-            term = (q_intr_c * mass_den_c * exp_val) / denom
-            
-            # Weight by integration factors
-            weighted_term = term * du_j * w_j
-            
-            # Sum over quadrature points
-            comp_integral = weighted_term.sum(axis=1).squeeze()
-            
-            # Accumulate to the result
-            integral_val += comp_integral
         
         # Multiply by the factor 2 pi G scale^2
         vc2_mge_factor = 2.0 * np.pi * G * (scale**2)
@@ -198,6 +188,8 @@ class Nuker_MGE(Module):
         
         surf = NN_output*I_b
         MGE_sigma = self.sigma*r_b
+        print(surf.mean().cpu())
+        print(MGE_sigma.mean().cpu())
         v_rot = self.MGE.velocity(x, y, z, surf = surf, sigma = MGE_sigma, qobs = qobs, G = G, soft = soft, quad_points = quad_points)
         return v_rot
 
