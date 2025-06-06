@@ -151,21 +151,33 @@ class MGEVelocity(Module):
         return v_rot
 
 class Nuker_MGE(Module):
-    def __init__(self, N_MGE_components: int, Nuker_NN, sigma_grid):
-        super().__init__("MGEVelocity")
+    def __init__(self, N_MGE_components: int, Nuker_NN, r_min, r_max, device):
+        super().__init__("NukerMGE")
         self.N_components = N_MGE_components
         self.MGE = MGEVelocity(self.N_components)
+        self.MGE.surf = torch.ones((self.N_components), device = device).to(dtype = torch.float64)
+        self.MGE.sigma = torch.ones((self.N_components), device = device).to(dtype = torch.float64)
+        self.MGE.qobs = torch.ones((self.N_components), device = device).to(dtype = torch.float64)
+        self.MGE.M_to_L = 1
         self.NN = Nuker_NN
-        self.sigma = sigma_grid
+
+        inner_slope=torch.tensor([3], device = device)
+        outer_slope=torch.tensor([3], device = device)
+        low_Gauss=torch.log10(r_min/torch.sqrt(inner_slope))
+        high_Gauss=torch.log10(r_max/torch.sqrt(outer_slope))
+        dx=(high_Gauss-low_Gauss)/self.N_components
+        self.sigma = 10**(low_Gauss+(0.5+torch.arange(self.N_components, device = device))*dx).to(dtype = torch.float64)
         
         self.inc   = Param("inc",   shape=())
         self.m_bh  = Param("m_bh",  shape=())
+        self.MGE.inc = self.inc
+        self.MGE.m_bh = self.m_bh
 
         self.q   = Param("qobs",   shape=())
 
-        self.alpha = Param("alpha", shape=())
-        self.beta = Param("beta", shape=())
-        self.gamma = Param("gamma", shape=())
+        self.alpha = Param("alpha", shape=(1, ))
+        self.beta = Param("beta", shape=(1, ))
+        self.gamma = Param("gamma", shape=(1, ))
         self.r_b = Param("break_r", shape = ())
         self.I_b = Param("intensity_r_b", shape = ())
 
@@ -179,18 +191,14 @@ class Nuker_MGE(Module):
         device = x.device
         dtype  = x.dtype
 
-        qobs = q*torch.ones(self.N_components)
-        self.MGE.qobs = qobs
-        self.MGE.inc = inc
-        self.MGE.m_bh = m_bh
+        qobs = q*torch.ones(self.N_components, device = device).to(dtype = torch.float64)
 
-        NN_input = torch.cat([alpha, gamma, beta])
-        NN_output = self.NN.forward(NN_input)
+        NN_input = torch.cat([alpha, gamma, beta]).to(torch.float32)
+        NN_output = self.NN.forward(NN_input).to(torch.float64)
         
-        self.MGE.surf = NN_output*I_b
-        self.MGE.sigma = self.sigma*r_b
-        
-        v_rot = self.MGE.velocity(x, y, z)
+        surf = NN_output*I_b
+        MGE_sigma = self.sigma*r_b
+        v_rot = self.MGE.velocity(x, y, z, surf = surf, sigma = MGE_sigma, qobs = qobs, G = G, soft = soft, quad_points = quad_points)
         return v_rot
 
 
