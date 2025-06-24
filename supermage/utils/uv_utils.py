@@ -101,21 +101,21 @@ def binned_uv_range(u, v, values, nyquist = False, shape = (600, 600), pad_uv = 
     maxuv = np.max((np.abs(u), np.abs(v)))
     return (-maxuv-pad_uv*maxuv, maxuv+pad_uv*maxuv)
 
-def gaussian_pb(diameter=12, freq=432058061289.4426, shape=(500, 500), deltal=0.004, device='cpu'):
+def gaussian_pb(diameter=12, freq=432058061289.4426, shape=(500, 500), deltal=0.004, device='cpu', dtype = torch.float64):
     c = 299792458  # Speed of light in m/s
     wavelength = c / freq
     fwhm = 1.02 * wavelength / diameter * (180 / torch.pi) * (3600)
     half_fov = deltal * shape[0] / 2
 
     # Grid for PB
-    x = torch.linspace(-half_fov, half_fov, shape[0], device=device, dtype = torch.float64)
-    y = torch.linspace(-half_fov, half_fov, shape[1], device=device, dtype = torch.float64)
+    x = torch.linspace(-half_fov, half_fov, shape[0], device=device, dtype = dtype)
+    y = torch.linspace(-half_fov, half_fov, shape[1], device=device, dtype = dtype)
     x, y = torch.meshgrid(x, y, indexing='xy')
 
     # Gaussian PB parameters
-    mean = torch.tensor([0.0, 0.0], device=device, dtype = torch.float64)  # Mean (center) of the Gaussian
+    mean = torch.tensor([0.0, 0.0], device=device, dtype = dtype)  # Mean (center) of the Gaussian
     std = fwhm / (2 * torch.sqrt(2 * torch.log(torch.tensor(2.0, device=device))))
-    covariance_matrix = torch.tensor([[std**2, 0], [0, std**2]], device=device, dtype = torch.float64)  # Covariance matrix
+    covariance_matrix = torch.tensor([[std**2, 0], [0, std**2]], device=device, dtype = dtype)  # Covariance matrix
 
     # 2-D Gaussian PB
     x_y = torch.stack([x.ravel(), y.ravel()], dim=1)

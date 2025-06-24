@@ -69,23 +69,23 @@ def freq_to_vel_systemic(freq, systemic_velocity, line = "co21"):
         velocities = c * (1 - freq / co21_rest_freq) - systemic_velocity
         return velocities, blueshifted_co21_freq
 
-def freq_to_vel_systemic_torch(freq, systemic_velocity, line = "co21", device = "cuda"):
+def freq_to_vel_systemic_torch(freq, systemic_velocity, line = "co21", device = "cuda", dtype = torch.float64):
     """
     Return velocity offsets (in km/s) relative to a systemic velocity (in km/s)
     given an array of frequencies (in GHz).
     """
     # Speed of light in km/s
-    c = torch.tensor(const.c.value, dtype = torch.float64, device = device)/1e3
+    c = torch.tensor(const.c.value, dtype = dtype, device = device)/1e3
     # Rest frequency of the CO(2-1) line in Hz
-    co21_rest_freq = torch.tensor(230.538, dtype = torch.float64, device = device)
+    co21_rest_freq = torch.tensor(230.538, dtype = dtype, device = device)
     if line == "co21":
         blueshifted_co21_freq = co21_rest_freq * (1 - systemic_velocity / c)
         velocities = c * (1 - freq / co21_rest_freq) - systemic_velocity
         return velocities, blueshifted_co21_freq
 
-def freq_to_vel_absolute_torch(freq, line="co21", device="cuda"):
-    c = torch.tensor(const.c.value, dtype=torch.float64, device=device) / 1e3
-    co21_rest_freq = torch.tensor(230.538, dtype=torch.float64, device=device)
+def freq_to_vel_absolute_torch(freq, line="co21", device="cuda", dtype = torch.float64):
+    c = torch.tensor(const.c.value, dtype=dtype, device=device) / 1e3
+    co21_rest_freq = torch.tensor(230.538, dtype=dtype, device=device)
     velocities = c * (1 - freq / co21_rest_freq)
     return velocities, co21_rest_freq
 
@@ -125,7 +125,7 @@ def rotate_spectral_cube(cube, angle):
     
     return rotated_cube
 
-def make_elliptical_gaussian_kernel(bmaj_arcsec, bmin_arcsec, bpa_deg, pixel_scale_arcsec, size_factor=6.0):
+def make_elliptical_gaussian_kernel(bmaj_arcsec, bmin_arcsec, bpa_deg, pixel_scale_arcsec, size_factor=6.0, dtype = torch.float32):
     """
     Create 2D elliptical Gaussian kernel using NumPy, returns a torch tensor.
     """
@@ -149,7 +149,7 @@ def make_elliptical_gaussian_kernel(bmaj_arcsec, bmin_arcsec, bpa_deg, pixel_sca
     kernel = np.exp(-0.5 * ((X_rot / sigma_x) ** 2 + (Y_rot / sigma_y) ** 2))
     kernel /= np.sum(kernel)
 
-    return torch.tensor(kernel, dtype=torch.float32)
+    return torch.tensor(kernel, dtype=dtype)
 
 def convolve_cube_with_beam(cube, kernel):
     """

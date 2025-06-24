@@ -141,22 +141,22 @@ class MGEVelocity(Module):
         return v_rot
 
 class Nuker_MGE(Module):
-    def __init__(self, N_MGE_components: int, Nuker_NN, r_min, r_max, device):
+    def __init__(self, N_MGE_components: int, Nuker_NN, r_min, r_max, device, dtype):
         super().__init__("NukerMGE")
         self.N_components = N_MGE_components
         self.MGE = MGEVelocity(self.N_components)
-        self.MGE.surf = torch.ones((self.N_components), device = device).to(dtype = torch.float64)
-        self.MGE.sigma = torch.ones((self.N_components), device = device).to(dtype = torch.float64)
-        self.MGE.qobs = torch.ones((self.N_components), device = device).to(dtype = torch.float64)
+        self.MGE.surf = torch.ones((self.N_components), device = device).to(dtype = dtype)
+        self.MGE.sigma = torch.ones((self.N_components), device = device).to(dtype = dtype)
+        self.MGE.qobs = torch.ones((self.N_components), device = device).to(dtype = dtype)
         self.MGE.M_to_L = 1
         self.NN = Nuker_NN
 
-        inner_slope=torch.tensor([3], device = device)
-        outer_slope=torch.tensor([3], device = device)
+        inner_slope=torch.tensor([3], device = device, dtype = dtype)
+        outer_slope=torch.tensor([3], device = device, dtype = dtype)
         low_Gauss=torch.log10(r_min/torch.sqrt(inner_slope))
         high_Gauss=torch.log10(r_max/torch.sqrt(outer_slope))
         dx=(high_Gauss-low_Gauss)/self.N_components
-        self.sigma = 10**(low_Gauss+(0.5+torch.arange(self.N_components, device = device))*dx).to(dtype = torch.float64)
+        self.sigma = 10**(low_Gauss+(0.5+torch.arange(self.N_components, device = device))*dx).to(dtype = dtype)
         
         self.inc   = Param("inc",   shape=())
         self.m_bh  = Param("m_bh",  shape=())
@@ -181,7 +181,7 @@ class Nuker_MGE(Module):
         device = x.device
         dtype  = x.dtype
 
-        qobs = q*torch.ones(self.N_components, device = device).to(dtype = torch.float64)
+        qobs = q*torch.ones(self.N_components, device = device).to(dtype = dtype)
 
         NN_input = torch.cat([alpha, gamma, beta]).to(torch.float32)
         NN_output = self.NN.forward(NN_input).to(torch.float64)

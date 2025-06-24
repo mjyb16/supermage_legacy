@@ -23,6 +23,7 @@ class CubeLens(Module):
         self.lens = lens
         self.source_cube = source_cube
         self.device = source_cube.device
+        self.dtype = source_cube.dtype
         self.upsample_factor = upsample_factor
         self.src = Pixelated(name="source", shape=(pixels_x_source, pixels_x_source), pixelscale=pixelscale_source, image = torch.zeros((pixels_x_source, pixels_x_source)))
 
@@ -30,7 +31,7 @@ class CubeLens(Module):
         thx, thy = caustics.utils.meshgrid(
             pixelscale_lens / upsample_factor,
             upsample_factor * pixels_x_lens,
-            dtype=torch.float32, device = source_cube.device
+            dtype=torch.float32, device = source_cube.device, dtype = source_cube.dtype
         )
 
         self.thx = thx

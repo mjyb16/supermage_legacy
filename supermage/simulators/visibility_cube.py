@@ -40,7 +40,8 @@ class VisibilityCube(Module):
                 freq=freq,
                 shape=(npix, npix),
                 deltal=pixelscale,
-                device=self.device
+                device=self.device,
+                dtype = self.dtype
             )
             pbs.append(pb)
         self.primary_beams = torch.stack(pbs, dim=0)  # shape (N_freq, Nx, Ny)
