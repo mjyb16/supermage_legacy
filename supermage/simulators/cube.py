@@ -11,12 +11,48 @@ from caustics.light import Pixelated
 from torch.nn.functional import avg_pool2d, conv2d
 import numpy as np
 
-def generate_meshgrid(grid_extent, gal_res, dtype = torch.float64, device = "cuda"):
+
+def generate_meshgrid(grid_extent, gal_res, dtype=torch.float64, device="cuda"):
     """
-    Generates grid for simulation
-    grid_extent: 2*r_galaxy usually
+    Generates a 3D centered meshgrid for simulation.
+
+    Parameters
+    ----------
+    grid_extent : float
+        Half the physical size of the box in each dimension (e.g., r_galaxy).
+    gal_res : int
+        Number of grid points along each dimension.
+    dtype : torch.dtype, optional
+        Desired tensor dtype. Defaults to torch.float64.
+    device : torch.device or str, optional
+        Device for tensor allocation. Defaults to 'cuda'.
+
+    Returns
+    -------
+    Tuple[Tensor, Tensor, Tensor]
+        3D meshgrid tensors (X, Y, Z) in physical units, centered on 0.
     """
-    return torch.meshgrid(torch.linspace(-grid_extent, grid_extent, gal_res, device = device, dtype = dtype), torch.linspace(-grid_extent, grid_extent, gal_res, device = device, dtype = dtype), torch.linspace(-grid_extent, grid_extent, gal_res, device = device, dtype = dtype), indexing = "ij")
+    # Coordinate range: [-1, 1], then scaled by extent and adjusted for pixel centering
+    coords = torch.linspace(-1, 1, gal_res, dtype=dtype, device=device) * 2*grid_extent * (gal_res - 1) / (2*gal_res)
+    X, Y, Z = torch.meshgrid(coords, coords, coords, indexing="ij")
+    return X, Y, Z
+
+def make_spatial_axis(fov_half, n_out, upscale, device="cuda", dtype=torch.float64):
+    """
+    Return the 1-D coordinate array for one spatial axis of the *fine* cube.
+
+    Parameters
+    ----------
+    fov_half   : half–width of the field of view (same units you want back)
+    n_out      : number of pixels in the *coarse* image (after pooling)
+    upscale    : image_upscale (number of fine pixels per coarse pixel)
+    """
+    n_hi = n_out * upscale                     # length of fine axis
+    dx_hi = 2 * fov_half / n_out / upscale     # fine-pixel size
+    # first coarse-pixel centre is -fov_half + dx_lo/2 = -fov_half + dx_hi*upscale/2
+    x_hi = (-fov_half + dx_hi * upscale / 2) + dx_hi * (torch.arange(n_hi,
+                               device=device, dtype=dtype) - 0.5 * upscale)
+    return x_hi, dx_hi
 
 class CubeSimulator(Module):
     """
@@ -65,14 +101,14 @@ class CubeSimulator(Module):
         self.image_upscale    = image_upscale
 
         # Image grid        
-        meshgrid = generate_meshgrid(cube_fov_half, self.image_res, dtype = self.dtype, device=self.device)
-        self.img_x = meshgrid[0]
-        self.img_y = meshgrid[1]
-        self.img_z = meshgrid[2]
+        x_hi, dx_hi = make_spatial_axis(cube_fov_half, image_res_out, image_upscale,
+                                device=self.device, dtype=self.dtype)
+        coords = torch.meshgrid(x_hi, x_hi, x_hi, indexing="ij")
+        self.img_x, self.img_y, self.img_z = coords
 
         # Frequency grid
         self.freqs = freqs
-        self.v_z = torch.zeros_like(meshgrid[0], device = self.device)
+        self.v_z = torch.zeros_like(self.img_z, device = self.device)
         #freq_first = freqs[0]
         #freq_last = freqs[-1]
         
