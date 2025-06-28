@@ -55,25 +55,10 @@ class MGEVelocity(Module):
         
         self.inc   = Param("inc",   shape=())
         self.m_bh  = Param("m_bh",  shape=())
-        
-        # --- fixed quadrature grid, registered as buffers -------------
-        xlim = torch.tensor([
-            torch.arcsinh(torch.log(1e-7 * mds)*2/np.pi),
-            torch.arcsinh(torch.log(1e3  * mxs)*2/np.pi)
-        ])
-        
-        # --- Gauss–Legendre on [0,1] ---
-        self.t_1d, self.w_1d = leggauss_interval(quad_points, xlim[0].item(), xlim[1].item(), self.device, self.dtype)
-        # --- Double-exponential transform t->u in (0,∞) ---
-        self.u_1d, self.du_1d = transform_DE(t_1d)
-        self.u_j = LazyTensor(self.u_1d.reshape(1, quad_points, 1))  # [1,Q,1]
-        self.w_j = LazyTensor(self.w_1d.reshape(1, quad_points, 1))  # [1,Q,1]
-        self.du_j = LazyTensor(self.du_1d.reshape(1, quad_points, 1))  # [1,Q,1]
-
-        self.Q = quad_points
+        self.quad_points = quad_points
 
     @forward
-    def velocity(self, x, y, z,
+    def velocity(self, R_flat,
                  surf=None, sigma=None, qobs=None, M_to_L=None,
                  inc=None, m_bh=None,
                  G=0.004301,
@@ -94,10 +79,6 @@ class MGEVelocity(Module):
         sqrt_2pi = np.sqrt(2.0*np.pi)
         mass_density = surf * M_to_L * qobs / (q_intr * sigma * sqrt_2pi)
         
-        x_flat = x.flatten()
-        y_flat = y.flatten()
-        z_flat = z.flatten()
-        R_flat = torch.sqrt(x_flat**2 + y_flat**2) #Cylindrical symmetry
         N_points = R_flat.shape[0]
         
         # Scale by median sigma
@@ -108,49 +89,53 @@ class MGEVelocity(Module):
 
         mds = sigma_sc.quantile(q = 0.5)
         mxs = torch.max(sigma_sc)
+        xlim = torch.tensor([
+            torch.arcsinh(torch.log(1e-7 * mds)*2/np.pi),
+            torch.arcsinh(torch.log(1e3  * mxs)*2/np.pi)
+        ])
         
+        # --- Gauss–Legendre on [0,1] ---
+        t_1d, w_1d = leggauss_interval(self.quad_points, xlim[0].item(), xlim[1].item(), self.device, self.dtype)
         
+        # --- Double-exponential transform t->u in (0,∞) ---
+        u_1d, du_1d = transform_DE(t_1d)
         
-        # KeOps LazyTensors for efficient computation
-        # Reshape for KeOps: [N,1] and [1,Q] formats
-        R_i = LazyTensor(R_sc.reshape(N_points, 1, 1))  # [N,1,1]
+        R_i  = R_sc.view(-1, 1, 1)                     # (N,1,1)
+        u_j  = u_1d.view(1,  -1, 1)                    # (1,Q,1)
+        w_j  = w_1d.view(1,  -1, 1)                    # (1,Q,1)
+        du_j = du_1d.view(1, -1, 1)                    # (1,Q,1)
         
-        # (1) pack all Gaussian parameters in one vector of shape (C,)
-        sigma_vec     = LazyTensor(sigma_sc.view(1, 1, -1))      # (1,1,C)
-        q_intr_vec    = LazyTensor(q_intr.view(1, 1, -1))
-        mass_den_vec  = LazyTensor(mass_density.view(1, 1, -1))
-
-
-        one_plus     = 1 + self.u_j
-        exponent     = -0.5 * R_i**2 / (sigma_vec**2 * one_plus)
-        exp_val      = exponent.exp()
-        denom        = one_plus**2 * (q_intr_vec**2 + self.u_j).sqrt()
+        sigma_mat    = sigma_sc.view(1, 1, -1)         # (1,1,C)
+        q_intr_mat   = q_intr.view(1, 1, -1)           # (1,1,C)
+        mass_den_mat = mass_density.view(1, 1, -1)     # (1,1,C)
         
-        term         = (q_intr_vec * mass_den_vec * exp_val) / denom
-        weighted     = term * self.du_j * self.w_j
+        # ---- kernel -----------------------------------------------------------------
+        one_plus = 1.0 + u_j                           # (1,Q,1)
+        exp_val  = torch.exp(-0.5 * R_i.pow(2) /
+                             (sigma_mat.pow(2) * one_plus))          # (N,Q,C)
         
-        # First reduce on the quadrature index j, then on the component index m
-        integral_val = weighted.sum(axis=1).sum(axis=1).squeeze()
-            
+        denom    = one_plus.pow(2) * torch.sqrt(q_intr_mat.pow(2) + u_j)
         
-        # Multiply by the factor 2 pi G scale^2
+        term      = (q_intr_mat * mass_den_mat * exp_val) / denom    # (N,Q,C)
+        weighted  = term * du_j * w_j                                # (N,Q,C)
+        
+        # ---- quadrature & component sums -------------------------------------------
+        integral_val = weighted.sum(dim=1).sum(dim=1)   # (N,)
+        
+        # ---- finish exactly as before ----------------------------------------------
         vc2_mge_factor = 2.0 * np.pi * G * (scale**2)
         vc2_mge = vc2_mge_factor * integral_val
         
-        # Black hole contribution
         vc2_bh = G * 10**m_bh / scale * (R_sc**2 + soft_sc**2).pow(-1.5)
         
-        # Final velocity
-        v_rot_flat = R_sc * torch.sqrt(vc2_mge + vc2_bh)
-        v_rot = v_rot_flat.reshape_as(x)
-        
-        return v_rot
+        v_rot_flat = R_sc * torch.sqrt(vc2_mge + vc2_bh)   # (N,)
+        return v_rot_flat
 
 class Nuker_MGE(Module):
     def __init__(self, N_MGE_components: int, Nuker_NN, r_min, r_max, device, dtype, quad_points=128):
         super().__init__("NukerMGE")
         self.N_components = N_MGE_components
-        self.MGE = MGEVelocity(self.N_components, quad_points = quad_points)
+        self.MGE = MGEVelocity(self.N_components, quad_points = quad_points, dtype = dtype, device = device)
         self.MGE.surf = torch.ones((self.N_components), device = device).to(dtype = dtype)
         self.MGE.sigma = torch.ones((self.N_components), device = device).to(dtype = dtype)
         self.MGE.qobs = torch.ones((self.N_components), device = device).to(dtype = dtype)
@@ -178,13 +163,13 @@ class Nuker_MGE(Module):
         self.I_b = Param("intensity_r_b", shape = ())
 
     @forward
-    def velocity(self, x, y, z,
+    def velocity(self, R_flat,
                  inc=None, m_bh=None, q = None,
                  alpha = None, beta = None, gamma = None, r_b = None, I_b = None,
                  G=0.004301,
                  soft=0.0):
-        device = x.device
-        dtype  = x.dtype
+        device = R_flat.device
+        dtype  = R_flat.dtype
 
         qobs = q*torch.ones(self.N_components, device = device).to(dtype = dtype)
 
@@ -193,7 +178,7 @@ class Nuker_MGE(Module):
         
         surf = NN_output*I_b
         MGE_sigma = self.sigma*r_b
-        v_rot = self.MGE.velocity(x, y, z, surf = surf, sigma = MGE_sigma, qobs = qobs, G = G, soft = soft)
+        v_rot = self.MGE.velocity(R_flat, surf = surf, sigma = MGE_sigma, qobs = qobs, G = G, soft = soft)
         return v_rot
 
 

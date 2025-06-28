@@ -54,6 +54,39 @@ def make_spatial_axis(fov_half, n_out, upscale, device="cuda", dtype=torch.float
                                device=device, dtype=dtype) - 0.5 * upscale)
     return x_hi, dx_hi
 
+def interpolate_velocity(R_grid: torch.Tensor,
+                         R_map : torch.Tensor,
+                         v_grid: torch.Tensor) -> torch.Tensor:
+    """
+    1-D linear interpolation on an arbitrary monotonic grid.
+    Any value outside [R_grid[0], R_grid[-1]] is clamped to the edges.
+    Works on CUDA tensors, keeps gradients, avoids out-of-bounds.
+    """
+    # 1. Clamp the query points to the grid range
+    R_clamp = R_map.clamp(min=R_grid[0], max=R_grid[-1])
+
+    # 2. Locate the interval: first index such that R_grid[idx_hi] ≥ R_clamp
+    idx_hi = torch.searchsorted(R_grid, R_clamp, right=False)
+
+    #   For values equal to R_grid[-1] we still get idx_hi == len(R_grid)
+    idx_hi = idx_hi.clamp(max=R_grid.numel() - 1)
+
+    # 3. Lower neighbour
+    idx_lo = (idx_hi - 1).clamp(min=0)
+
+    # 4. Gather the two bracketing points
+    R_lo, R_hi = R_grid[idx_lo], R_grid[idx_hi]
+    v_lo, v_hi = v_grid[idx_lo], v_grid[idx_hi]
+
+    # 5. Linear weight (when R_lo == R_hi, weight → 0)
+    w = torch.where(
+        R_hi == R_lo,
+        torch.zeros_like(R_lo),
+        (R_clamp - R_lo) / (R_hi - R_lo)
+    )
+
+    return v_lo + w * (v_hi - v_lo)
+
 class CubeSimulator(Module):
     """
     Parameters for init
@@ -75,7 +108,7 @@ class CubeSimulator(Module):
     image_upscale : int
         Factor by which image_res_out is multiplied. High internal resolution can be needed to prevent aliasing.
     """
-    def __init__(self, velocity_model, intensity_model, freqs, systemic_or_redshift, frequency_upscale, cube_fov_half, image_res_out, image_upscale, line="co21", device = "cuda", dtype = torch.float64):
+    def __init__(self, velocity_model, intensity_model, freqs, systemic_or_redshift, frequency_upscale, cube_fov_half, image_res_out, image_upscale, radius_res, line="co21", device = "cuda", dtype = torch.float64):
         super().__init__()
         self.device = device
         self.dtype = dtype
@@ -101,6 +134,7 @@ class CubeSimulator(Module):
         self.image_upscale    = image_upscale
 
         # Image grid        
+        self.pixelscale_pc = cube_fov_half*2/(image_res_out*image_upscale)
         x_hi, dx_hi = make_spatial_axis(cube_fov_half, image_res_out, image_upscale,
                                 device=self.device, dtype=self.dtype)
         coords = torch.meshgrid(x_hi, x_hi, x_hi, indexing="ij")
@@ -129,6 +163,8 @@ class CubeSimulator(Module):
         # Constants
         self.pi = torch.tensor(pi, device = self.device)
 
+        self.radius_res = radius_res
+
     @forward
     def forward(
         self,
@@ -136,7 +172,19 @@ class CubeSimulator(Module):
     ):
         rot_x, rot_y, rot_z = DoRotation(self.img_x, self.img_y, self.img_z, inclination, sky_rot, device = self.device)
 
-        v_abs = self.velocity_model.velocity(rot_x, rot_y, rot_z).nan_to_num(posinf=0, neginf=0)
+        # cylindrical radii in the **galaxy** frame
+        R_map = torch.sqrt(rot_x**2 + rot_y**2)
+        Rmin = 0.1*self.pixelscale_pc
+        Rmax = R_map.max()
+
+        R_grid = torch.logspace(np.log10(Rmin), np.log10(Rmax), self.radius_res,
+                        device=self.device, dtype=self.dtype)
+        
+        # one call to the heavy integrator
+        v_grid = self.velocity_model.velocity(R_grid, soft=Rmin)   # (NR,)
+
+        v_abs = interpolate_velocity(R_grid, R_map, v_grid)
+        # --------------------------------------------
         
         theta_rot = torch.atan2(rot_y, rot_x)
         v_x = -v_abs * torch.sin(theta_rot)
