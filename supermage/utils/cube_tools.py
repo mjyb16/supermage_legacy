@@ -151,6 +151,82 @@ def make_elliptical_gaussian_kernel(bmaj_arcsec, bmin_arcsec, bpa_deg, pixel_sca
 
     return torch.tensor(kernel, dtype=dtype)
 
+from astropy.nddata import Cutout2D
+
+def make_elliptical_gaussian_kernel_compatible(
+    xpixels, ypixels, beamSize, pixel_scale_arcsec=1.0, cent=None, size_factor=None, dtype=np.float64
+):
+    """
+    Mimics makebeam(), returning a trimmed elliptical Gaussian PSF based on beam size.
+    Returns a NumPy array (not Torch tensor).
+    """
+
+    # Default center
+    if cent is None:
+        cent = [xpixels / 2, ypixels / 2]
+
+    # Handle beamSize input
+    beamSize = np.array(beamSize, dtype=np.float64)
+    try:
+        if len(beamSize) == 2:
+            beamSize = np.append(beamSize, 0)
+        if beamSize[1] > beamSize[0]:
+            beamSize[1], beamSize[0] = beamSize[0], beamSize[1]
+        if beamSize[2] >= 180:
+            beamSize[2] -= 180
+    except:
+        beamSize = np.array([beamSize, beamSize, 0], dtype=np.float64)
+
+    bmaj, bmin, bpa = beamSize
+
+    # Convert FWHM to sigma in pixels
+    st_dev = beamSize[:2] / pixel_scale_arcsec / 2.355
+    sigma_x, sigma_y = st_dev
+
+    # Directional factor (to match makebeam logic)
+    rot_rad = np.radians(bpa)
+    dirfac = np.sign(np.tan(rot_rad)) if np.tan(rot_rad) != 0 else 1.0
+
+    # Create coordinate grid
+    y, x = np.indices((int(ypixels), int(xpixels)), dtype=dtype)
+    x -= cent[0]
+    y -= cent[1]
+
+    # Quadratic form coefficients
+    a = (np.cos(rot_rad) ** 2) / (2 * sigma_y**2) + (np.sin(rot_rad) ** 2) / (2 * sigma_x**2)
+    b = (dirfac * (np.sin(2 * rot_rad) ** 2)) / (4 * sigma_y**2) - (dirfac * (np.sin(2 * rot_rad) ** 2)) / (4 * sigma_x**2)
+    c = (np.sin(rot_rad) ** 2) / (2 * sigma_y**2) + (np.cos(rot_rad) ** 2) / (2 * sigma_x**2)
+
+    psf = np.exp(-1 * (a * x ** 2 - 2 * b * x * y + c * y ** 2))
+
+    # Threshold
+    psf[psf < 1e-5] = 0.0
+
+    # Determine cut direction based on PA
+    if 45 < bpa < 135:
+        flat = np.sum(psf, axis=1)
+    else:
+        flat = np.sum(psf, axis=0)
+
+    idx = np.where(flat > 0)[0]
+    newsize = idx[-1] - idx[0]
+
+    # Ensure odd-sized trimmed kernel
+    if newsize % 2 == 0:
+        newsize += 1
+    else:
+        newsize += 2
+
+    # Don't exceed full size
+    min_size = min(xpixels, ypixels)
+    if newsize > min_size:
+        newsize = min_size - 1 if min_size % 2 == 0 else min_size
+
+    # Trim using Cutout2D
+    trimmed_psf = Cutout2D(psf, (cent[1], cent[0]), newsize).data
+
+    return trimmed_psf
+
 def convolve_cube_with_beam(cube, kernel):
     """
     Convolve spatial dimensions of a 3D cube with the given 2D kernel.

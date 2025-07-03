@@ -198,14 +198,15 @@ class CubeSimulator(Module):
         intensity_cube = source_img_cube.unsqueeze(-1)
         sig_sq = line_broadening**2
         if self.systemic_or_redshift == "systemic":
-            velocity_labels, _ = freq_to_vel_absolute_torch(self.cube_z_l_keops, self.line, device = self.device, dtype = self.dtype)#velocity_shift, self.line, device = self.device)
+            velocity_labels_unshifted, _ = freq_to_vel_absolute_torch(self.cube_z_l_keops, self.line, device = self.device, dtype = self.dtype)
+            velocity_labels = velocity_labels_unshifted  - velocity_shift
         elif self.systemic_or_redshift == "redshift":
             print("Need to implement redshift")
             return
         else:
             print("Please specify 'redshift' or 'systemic'")
             return
-        kde_dist = (-1*(velocity_labels - (v_los_keops + velocity_shift))**2 / sig_sq).exp()
+        kde_dist = (-1*(velocity_labels - v_los_keops)**2 / sig_sq).exp()
         cube = (kde_dist @ intensity_cube) * (1/torch.sqrt(2*self.pi*sig_sq))
         cube_final = torch.squeeze(cube)
 
