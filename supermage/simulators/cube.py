@@ -51,7 +51,7 @@ def make_spatial_axis(fov_half, n_out, upscale, device="cuda", dtype=torch.float
     dx_hi = 2 * fov_half / n_out / upscale     # fine-pixel size
     # first coarse-pixel centre is -fov_half + dx_lo/2 = -fov_half + dx_hi*upscale/2
     x_hi = (-fov_half + dx_hi * upscale / 2) + dx_hi * (torch.arange(n_hi,
-                               device=device, dtype=dtype) - 0.5 * upscale)
+                               device=device, dtype=dtype) + 0.5 * upscale)
     return x_hi, dx_hi
 
 def interpolate_velocity(R_grid: torch.Tensor,
@@ -148,7 +148,7 @@ class CubeSimulator(Module):
         
         #self.freqs_upsampled = torch.linspace(self.freqs[0], self.freqs[-1], self.frequency_res, device = self.device, dtype = self.dtype)
         df = (self.freqs[-1] - self.freqs[0]) / (self.frequency_res - 1)
-        self.freqs_upsampled = self.freqs[0] + df * (torch.arange(self.frequency_res, device=self.device, dtype=self.dtype) - (0.5*self.frequency_upscale))
+        self.freqs_upsampled = self.freqs[0] + df * (torch.arange(self.frequency_res, device=self.device, dtype=self.dtype) + (0.5*self.frequency_upscale))
         
         cube_z_labels = self.freqs_upsampled * torch.ones((self.image_res, self.image_res, self.frequency_res), device = self.device, dtype = self.dtype)
         self.cube_z_l_keops = LazyTensor(cube_z_labels.unsqueeze(-1).expand(self.image_res, self.image_res, self.frequency_res, 1)[:, :, :, None, :])
@@ -198,8 +198,8 @@ class CubeSimulator(Module):
         intensity_cube = source_img_cube.unsqueeze(-1)
         sig_sq = line_broadening**2
         if self.systemic_or_redshift == "systemic":
-            velocity_labels_unshifted, _ = freq_to_vel_absolute_torch(self.cube_z_l_keops, self.line, device = self.device, dtype = self.dtype)
-            velocity_labels = velocity_labels_unshifted  - velocity_shift
+            velocity_labels_unshifted, _ = freq_to_vel_absolute_torch(self.cube_z_l_keops, self.line, device = self.device, dtype = self.dtype) 
+            velocity_labels = velocity_labels_unshifted - velocity_shift
         elif self.systemic_or_redshift == "redshift":
             print("Need to implement redshift")
             return

@@ -101,7 +101,7 @@ class MGEVelocity(Module):
         u_1d, du_1d = transform_DE(t_1d)
         
         R_i  = R_sc.view(-1, 1, 1)                     # (N,1,1)
-        u_j  = u_1d.view(1,  -1, 1)                    # (1,Q,1)
+        u_j  = u_1d.view(1,  -1, 1)                    # (1,Q,1)torch.linspace(-1, 1, nx, device=device, dtype=dtype) * pixelscale * (nx - 1) / 2
         w_j  = w_1d.view(1,  -1, 1)                    # (1,Q,1)
         du_j = du_1d.view(1, -1, 1)                    # (1,Q,1)
         
