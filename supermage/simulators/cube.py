@@ -36,9 +36,9 @@ def generate_meshgrid(grid_extent, gal_res, dtype=torch.float64, device="cuda"):
     coords = torch.linspace(-1, 1, gal_res, dtype=dtype, device=device) * 2*grid_extent * (gal_res - 1) / (2*gal_res)
     X, Y, Z = torch.meshgrid(coords, coords, coords, indexing="ij")
     return X, Y, Z
-
+"""
 def make_spatial_axis(fov_half, n_out, upscale, device="cuda", dtype=torch.float64):
-    """
+    
     Return the 1-D coordinate array for one spatial axis of the *fine* cube.
 
     Parameters
@@ -46,13 +46,42 @@ def make_spatial_axis(fov_half, n_out, upscale, device="cuda", dtype=torch.float
     fov_half   : half–width of the field of view (same units you want back)
     n_out      : number of pixels in the *coarse* image (after pooling)
     upscale    : image_upscale (number of fine pixels per coarse pixel)
-    """
+    
     n_hi = n_out * upscale                     # length of fine axis
     dx_hi = 2 * fov_half / (n_hi-1)     # fine-pixel size
     # first coarse-pixel centre is -fov_half + dx_lo/2 = -fov_half + dx_hi*upscale/2
     x_hi = (-fov_half + dx_hi * upscale / 2) + dx_hi * (torch.arange(n_hi,
                                device=device, dtype=dtype) - 0.5 * upscale)
     return x_hi, dx_hi
+"""
+def make_spatial_axis(fov_half, n_out, upscale, device="cuda", dtype=torch.float64):
+    n_hi = n_out * upscale
+    dx_hi = 2 * fov_half / (n_hi - 1)
+    center_index = (n_hi - 1) / 2
+    x_hi = dx_hi * (torch.arange(n_hi, device=device, dtype=dtype) - center_index)
+    return x_hi, dx_hi
+
+
+def make_frequency_axis(freqs_coarse: torch.Tensor,
+                        upscale: int,
+                        device="cuda",
+                        dtype=torch.float64):
+    """
+    Build the high-resolution frequency axis whose simple block average
+    (or mean pooling) collapses back to `freqs_coarse`.
+    """
+    Δf_coarse = freqs_coarse[1] - freqs_coarse[0]          # coarse step
+    Δf_fine   = Δf_coarse / upscale                        # fine step
+    n_fine    = freqs_coarse.numel() * upscale             # total fine samples
+
+    # first fine-pixel centre sits *upscale/2* fine steps below the
+    # first coarse-pixel centre
+    f0_fine = freqs_coarse[0] - (upscale - 1) * Δf_fine / 2
+
+    freqs_fine = f0_fine + Δf_fine * torch.arange(n_fine,
+                                                  device=device,
+                                                  dtype=dtype)
+    return freqs_fine, Δf_fine
 
 def interpolate_velocity(R_grid: torch.Tensor,
                          R_map : torch.Tensor,
@@ -128,7 +157,6 @@ class CubeSimulator(Module):
         
         # Internal resolutions
         self.freq_res_out = len(freqs)
-        self.frequency_res = self.freq_res_out * frequency_upscale
         self.image_res    = image_res_out * image_upscale
         self.frequency_upscale = frequency_upscale
         self.image_upscale    = image_upscale
@@ -143,13 +171,18 @@ class CubeSimulator(Module):
         # Frequency grid
         self.freqs = freqs
         self.v_z = torch.zeros_like(self.img_z, device = self.device)
-        #freq_first = freqs[0]
-        #freq_last = freqs[-1]
         
-        #self.freqs_upsampled = torch.linspace(self.freqs[0], self.freqs[-1], self.frequency_res, device = self.device, dtype = self.dtype)
-        df = (self.freqs[-1] - self.freqs[0]) / (self.frequency_res - 1)
-        #self.freqs_upsampled = self.freqs[0] + df * (torch.arange(self.frequency_res, device=self.device, dtype=self.dtype) - (0.5*self.frequency_upscale))
-        self.freqs_upsampled = torch.linspace(self.freqs[0], self.freqs[-1], self.frequency_res, device=self.device, dtype=self.dtype)
+        #delta = (self.freqs[-1] - self.freqs[0]) / (len(self.freqs) - 1)
+        #upsampled_step = delta / frequency_upscale
+        #n_upsampled = (len(self.freqs)-1)*frequency_upscale + 1
+        
+        #self.freqs_upsampled = self.freqs[0] + upsampled_step * torch.arange(n_upsampled, dtype=self.dtype, device=self.device)
+        #self.frequency_res = n_upsampled
+
+        self.freqs_upsampled, _ = make_frequency_axis(
+        self.freqs, self.frequency_upscale,
+        device=self.device, dtype=self.dtype)
+        self.frequency_res = self.freqs_upsampled.numel()
         
         cube_z_labels = self.freqs_upsampled * torch.ones((self.image_res, self.image_res, self.frequency_res), device = self.device, dtype = self.dtype)
         self.cube_z_l_keops = LazyTensor(cube_z_labels.unsqueeze(-1).expand(self.image_res, self.image_res, self.frequency_res, 1)[:, :, :, None, :])
