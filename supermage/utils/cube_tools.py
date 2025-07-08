@@ -6,10 +6,12 @@ from torch.nn.functional import avg_pool2d
 from supermage.utils.coord_utils import e_radius, pixel_size_background
 import matplotlib.pyplot as plt
 from astropy import constants as const
+from astropy.nddata import Cutout2D
 from scipy import signal
 from scipy import ndimage
 from scipy.ndimage import uniform_filter
 from scipy.ndimage import rotate
+from typing import Tuple, Union
 
 
 def dirty_cube_tool(vis_bin_re_cube, vis_bin_imag_cube, roi_start, roi_end):
@@ -102,6 +104,127 @@ def velocity_map(cube, velocities):
     
     return vel_map
 
+def create_pvd(rotated_cube, slice_start, slice_end):
+    """
+    Rotated cube: shape (n_minor_axis, n_major_axis, n_freq)
+    """
+    return np.flip(np.rot90(rotated_cube[slice_start:slice_end, :, :].sum(axis = 0)))
+
+def rotate_spectral_cube_center_offset_arcsec(
+    cube_in: np.ndarray,
+    angle_deg: float,
+    center_offset_arcsec: Tuple[float, float] = (0.0, 0.0),
+    pixel_scale: float = 1.0,
+    pad_mode: str = "constant",
+    pad_cval: Union[int, float] = 0.0,
+    interp_order: int = 3,
+):
+    """
+    Rotate a spectral cube around a point specified as an *arcsecond offset*
+    from the cube’s geometric centre.
+
+    Parameters
+    ----------
+    cube : ndarray, shape (ny, nx, nchan)
+        Spectral cube (channel-first).
+    angle_deg : float
+        Counter-clockwise rotation angle (degrees).
+    center_offset_arcsec : (dx, dy)
+        Offset from the cube centre in arcseconds:
+            dx > 0 → right,  dy > 0 → up.
+        Fractions allowed.
+    pixel_scale : float
+        Arcseconds per pixel (or any unit per pixel),
+        used for the offset conversion *and* to report the new extent.
+    pad_mode / pad_cval / interp_order
+        Passed through to `np.y0.item()pad` and `scipy.ndimage.rotate`.
+
+    Returns
+    -------
+    rotated_cube : ndarray
+        Padded & rotated cube.
+    extent : ((x_min, x_max), (y_min, y_max))
+        Spatial extent in the same physical units as `pixel_scale`.
+        The rotation point is at (0, 0).
+    """
+    ny, nx, n_chan = cube_in.shape
+
+    # ------------------------------------------------------------------
+    # 1. Convert arcsecond offset → pixel offset
+    # ------------------------------------------------------------------
+    dx_arcsec, dy_arcsec = center_offset_arcsec
+    dx_pix = dx_arcsec / pixel_scale
+    dy_pix = dy_arcsec / pixel_scale
+
+    # geometric centre of the original image
+    cx_orig = (nx - 1) / 2.0
+    cy_orig = (ny - 1) / 2.0
+
+    # absolute pixel coordinates of the rotation point
+    x0 = cx_orig + dx_pix
+    y0 = cy_orig + dy_pix
+
+    # ------------------------------------------------------------------
+    # 2. Pad so that (x0, y0) becomes the image centre
+    # ------------------------------------------------------------------
+    left   = x0
+    right  = nx - 1 - x0
+    top    = y0
+    bottom = ny - 1 - y0
+
+    half_width  = int(np.ceil(max(left, right )))
+    half_height = int(np.ceil(max(top , bottom)))
+
+    nx_pad = 2 * half_width  + 1
+    ny_pad = 2 * half_height + 1
+
+    pad_left   = half_width  - int(np.floor(left))
+    pad_right  = half_width  - int(np.floor(right))
+    pad_top    = half_height - int(np.floor(top))
+    pad_bottom = half_height - int(np.floor(bottom))
+
+    pad_width = (
+        (0, 0),                      # spectral axis
+        (pad_top, pad_bottom),       # y
+        (pad_left, pad_right),       # x
+    )
+
+    cube = np.moveaxis(cube_in, -1, 0)
+
+    cube_padded = np.pad(
+        cube, pad_width, mode=pad_mode, constant_values=pad_cval
+    )
+
+    # ------------------------------------------------------------------
+    # 3. Rotate every channel about the new centre
+    # ------------------------------------------------------------------
+    rotated_cube = np.empty_like(cube_padded)
+    for k in range(n_chan):
+        rotated_cube[k] = ndimage.rotate(
+            cube_padded[k],
+            angle_deg,
+            reshape=False,
+            order=interp_order,
+            mode=pad_mode,
+            cval=pad_cval,
+        )
+
+    # ------------------------------------------------------------------
+    # 4. Compute physical extent
+    # ------------------------------------------------------------------
+    cx_new = (nx_pad - 1) / 2.0
+    cy_new = (ny_pad - 1) / 2.0
+    x_min = -(cx_new) * pixel_scale
+    x_max = +(nx_pad - 1 - cx_new) * pixel_scale
+    y_min = -(cy_new) * pixel_scale
+    y_max = +(ny_pad - 1 - cy_new) * pixel_scale
+    dx = (x_max - x_min)/rotated_cube.shape[2] 
+    dy = (y_max - y_min)/rotated_cube.shape[1]
+    extent = (x_min - dx/2, x_max+dx/2, y_min - dy/2, y_max + dy/2)
+    #extent = (x_min, x_max, y_min, y_max)
+    
+    return np.moveaxis(rotated_cube, 0, -1), extent
+
 def rotate_spectral_cube(cube, angle):
     """
     Rotate a spectral image cube by a specific angle.
@@ -150,8 +273,6 @@ def make_elliptical_gaussian_kernel(bmaj_arcsec, bmin_arcsec, bpa_deg, pixel_sca
     kernel /= np.sum(kernel)
 
     return torch.tensor(kernel, dtype=dtype)
-
-from astropy.nddata import Cutout2D
 
 def make_elliptical_gaussian_kernel_compatible(
     xpixels, ypixels, beamSize, pixel_scale_arcsec=1.0, cent=None, size_factor=None, dtype=np.float64
