@@ -10,7 +10,7 @@ import caustics
 from caustics.light import Pixelated
 from torch.nn.functional import avg_pool2d, conv2d
 import numpy as np
-
+import math
 
 def make_spatial_axis(fov_half, n_out, upscale, device="cuda", dtype=torch.float64):
     n_hi = n_out * upscale
@@ -177,6 +177,156 @@ class CubeSimulator(Module):
         # Shape => (1, 1, frequency_res_out, image_res_out, image_res_out)
         cube_downsampled = cube_downsampled.squeeze(0).squeeze(0)
         torch.cuda.empty_cache()
+        return cube_downsampled
+
+class CubeSimulatorSlabbed(Module):
+    """
+    Parameters for init
+    ----------
+    velocity_model : Module
+        SuperMAGE velocity field model
+    intensity_model : Module
+        SuperMAGE intensity/brightness field model
+    freqs : Tensor (1D)
+        Frequencies at which to evaluate the cube.
+    velocity_upscale : int
+        Factor by which velocity_res_out is multiplied. High internal resolution needed to prevent aliasing (rec. 5x).
+    velocity_min, velocity_max : float
+        Velocity range (in km/s).
+    cube_fov_half : float
+        Spatial extent of the cube (pc). Gives half length of one side.
+    image_res_out : int
+        Final (downsampled) number of image pixels (2D) returned for the cube's spatial dimensions.
+    image_upscale : int
+        Factor by which image_res_out is multiplied. High internal resolution can be needed to prevent aliasing.
+    """
+    def __init__(self, velocity_model, intensity_model, freqs, systemic_or_redshift, frequency_upscale, cube_fov_half, image_res_out, image_upscale, line="co21", device = "cuda", dtype = torch.float64):
+        super().__init__()
+        self.device = device
+        self.dtype = dtype
+        self.velocity_model = velocity_model
+        self.intensity_model = intensity_model
+
+        self.inclination = Param("inclination", None)
+        self.velocity_model.inc = self.inclination
+        self.sky_rot = Param("sky_rot", None)
+        self.line_broadening = Param("line_broadening", None)
+        self.velocity_shift = Param("velocity_shift", None)
+
+        # Determine whether we want systemic velocity or redshift
+        self.systemic_or_redshift = systemic_or_redshift
+        self.line = line
+        
+        # Internal resolutions
+        self.image_res    = image_res_out * image_upscale
+        self.frequency_upscale = frequency_upscale
+        self.image_upscale    = image_upscale
+
+        # Image grid        
+        self.pixelscale_pc = cube_fov_half*2/(self.image_res)
+        self.x_hi, dx_hi = make_spatial_axis(cube_fov_half, image_res_out, image_upscale,
+                                device=self.device, dtype=self.dtype)
+
+        # Frequency grid
+        self.freqs = freqs
+        self.freqs_upsampled, _ = make_frequency_axis(self.freqs, self.frequency_upscale, device=self.device, dtype=self.dtype)
+        self.frequency_res = self.freqs_upsampled.numel()
+
+        # Keops version of frequency grid
+        cube_z_labels = self.freqs_upsampled * torch.ones((self.image_res, self.image_res, self.frequency_res), device = self.device, dtype = self.dtype)
+        self.cube_z_l_keops = LazyTensor(cube_z_labels.unsqueeze(-1).expand(self.image_res, self.image_res, self.frequency_res, 1)[:, :, :, None, :])
+        
+        # Constants
+        self.pi = torch.tensor(pi, device = self.device)
+    @forward
+    def forward(
+        self,
+        inclination=None, sky_rot=None, line_broadening=None, velocity_shift = None, 
+    ):
+        slab_size = 16  # Can be tuned (e.g., 16, 32, or 64)
+    
+        image_res = self.image_res
+        N = image_res
+        x_hi = self.freqs.new_tensor(self.x_hi)
+    
+        # Precompute 2D spatial grid (img_x, img_y), shared across slabs
+        x = x_hi.view(-1, 1, 1)
+        y = x_hi.view(1, -1, 1)
+    
+        # Frequency grid: keep 1D form and broadcast via KeOps later
+        velocity_labels_unshifted, _ = freq_to_vel_absolute_torch(
+            self.freqs_upsampled, self.line, device=self.device, dtype=self.dtype
+        )
+        velocity_labels = velocity_labels_unshifted - velocity_shift
+        velocity_labels = velocity_labels.view(1, 1, -1, 1)  # [1, 1, F, 1]
+    
+        # Precompute normalization constant
+        sig_sq = line_broadening ** 2
+        norm_factor = 1 / torch.sqrt(2 * math.pi * sig_sq)
+    
+        cube_accumulator = []
+    
+        for z0 in range(0, N, slab_size):
+            z1 = min(z0 + slab_size, N)
+            z = x_hi[z0:z1].view(1, 1, -1)  # Only current z slab
+    
+            # Create slab grids: shape [N, N, slab_size]
+            img_x, img_y, img_z = torch.broadcast_tensors(x, y, z)
+    
+            # Rotate coordinates
+            rot_x, rot_y, rot_z = DoRotation(img_x, img_y, img_z, inclination, sky_rot, device=self.device)
+    
+            # Intensity field
+            source_intensity_cube = self.intensity_model.brightness(rot_x, rot_y, rot_z)
+            intensity_slab = source_intensity_cube.unsqueeze(-1)  # [N, N, slab, 1]
+            del source_intensity_cube, img_x, img_y, img_z, rot_z
+    
+            # Velocity field
+            v_abs = self.velocity_model.velocity(rot_x, rot_y, None)  # [N, N, slab]
+            theta_rot = torch.atan2(rot_y, rot_x)
+            del rot_x, rot_y
+    
+            v_x = -v_abs * torch.sin(theta_rot)
+            v_y =  v_abs * torch.cos(theta_rot)
+            del v_abs, theta_rot
+    
+            v_z = torch.zeros_like(v_x)  # shape [N, N, slab]
+            v_x_r, v_y_r, v_los_r = DoRotationT(v_x, v_y, v_z, inclination, sky_rot, device=self.device)
+            del v_x, v_y, v_z
+    
+
+            # Reshape so slab axis is nj (KeOps "j" dimension)
+            # Reshape frequency axis as j-dimension (summation over slab)
+            velocity_labels = velocity_labels.view(1, 1, 1, F, 1)  # [1,1,1,F,1]
+            v_los_keops = LazyTensor(v_los_r[:, :, :, None, None])  # [N,N,slab,1,1]
+            
+            # Do not create pdm! Instead, directly form the kernel-weighted contraction:
+            intensity_slab = intensity_slab.requires_grad_()  # if needed
+            intensity_kt = LazyTensor(intensity_slab[:, :, :, None, :])  # [N,N,slab,1,1]
+            
+            # Now apply kernel contraction manually using KeOps
+            cube_slab = (
+                (-0.5 * (v_los_keops - velocity_labels) ** 2 / sig_sq).exp()
+                * intensity_kt
+            ).sum(dim=2) * norm_factor  # sum over LOS axis (slab)
+            del v_los_r, v_los_keops, intensity_slab, pdm
+    
+            cube_accumulator.append(cube_slab)
+    
+        # Concatenate slabs along LOS axis
+        cube_full = torch.cat(cube_accumulator, dim=2)  # [N, N, frequency_res]
+    
+        # Rearrange axes to match expected shape: (F, H, W)
+        cube_final_3D = cube_full.permute(2, 0, 1)
+    
+        # Downsample via average pooling
+        cube_5d = cube_final_3D.unsqueeze(0).unsqueeze(0)
+        cube_downsampled = F.avg_pool3d(
+            cube_5d,
+            kernel_size=(self.frequency_upscale, self.image_upscale, self.image_upscale),
+            stride=(self.frequency_upscale, self.image_upscale, self.image_upscale)
+        ).squeeze(0).squeeze(0)  # Final shape: [F_out, H_out, W_out]
+    
         return cube_downsampled
 
 
