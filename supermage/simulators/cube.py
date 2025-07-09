@@ -12,48 +12,6 @@ from torch.nn.functional import avg_pool2d, conv2d
 import numpy as np
 
 
-def generate_meshgrid(grid_extent, gal_res, dtype=torch.float64, device="cuda"):
-    """
-    Generates a 3D centered meshgrid for simulation.
-
-    Parameters
-    ----------
-    grid_extent : float
-        Half the physical size of the box in each dimension (e.g., r_galaxy).
-    gal_res : int
-        Number of grid points along each dimension.
-    dtype : torch.dtype, optional
-        Desired tensor dtype. Defaults to torch.float64.
-    device : torch.device or str, optional
-        Device for tensor allocation. Defaults to 'cuda'.
-
-    Returns
-    -------
-    Tuple[Tensor, Tensor, Tensor]
-        3D meshgrid tensors (X, Y, Z) in physical units, centered on 0.
-    """
-    # Coordinate range: [-1, 1], then scaled by extent and adjusted for pixel centering
-    coords = torch.linspace(-1, 1, gal_res, dtype=dtype, device=device) * 2*grid_extent * (gal_res - 1) / (2*gal_res)
-    X, Y, Z = torch.meshgrid(coords, coords, coords, indexing="ij")
-    return X, Y, Z
-"""
-def make_spatial_axis(fov_half, n_out, upscale, device="cuda", dtype=torch.float64):
-    
-    Return the 1-D coordinate array for one spatial axis of the *fine* cube.
-
-    Parameters
-    ----------
-    fov_half   : half–width of the field of view (same units you want back)
-    n_out      : number of pixels in the *coarse* image (after pooling)
-    upscale    : image_upscale (number of fine pixels per coarse pixel)
-    
-    n_hi = n_out * upscale                     # length of fine axis
-    dx_hi = 2 * fov_half / (n_hi-1)     # fine-pixel size
-    # first coarse-pixel centre is -fov_half + dx_lo/2 = -fov_half + dx_hi*upscale/2
-    x_hi = (-fov_half + dx_hi * upscale / 2) + dx_hi * (torch.arange(n_hi,
-                               device=device, dtype=dtype) - 0.5 * upscale)
-    return x_hi, dx_hi
-"""
 def make_spatial_axis(fov_half, n_out, upscale, device="cuda", dtype=torch.float64):
     n_hi = n_out * upscale
     dx_hi = 2 * fov_half / (n_hi - 1)
@@ -83,38 +41,6 @@ def make_frequency_axis(freqs_coarse: torch.Tensor,
                                                   dtype=dtype)
     return freqs_fine, Δf_fine
 
-def interpolate_velocity(R_grid: torch.Tensor,
-                         R_map : torch.Tensor,
-                         v_grid: torch.Tensor) -> torch.Tensor:
-    """
-    1-D linear interpolation on an arbitrary monotonic grid.
-    Any value outside [R_grid[0], R_grid[-1]] is clamped to the edges.
-    Works on CUDA tensors, keeps gradients, avoids out-of-bounds.
-    """
-    # 1. Clamp the query points to the grid range
-    R_clamp = R_map.clamp(min=R_grid[0], max=R_grid[-1])
-
-    # 2. Locate the interval: first index such that R_grid[idx_hi] ≥ R_clamp
-    idx_hi = torch.searchsorted(R_grid, R_clamp, right=False)
-
-    #   For values equal to R_grid[-1] we still get idx_hi == len(R_grid)
-    idx_hi = idx_hi.clamp(max=R_grid.numel() - 1)
-
-    # 3. Lower neighbour
-    idx_lo = (idx_hi - 1).clamp(min=0)
-
-    # 4. Gather the two bracketing points
-    R_lo, R_hi = R_grid[idx_lo], R_grid[idx_hi]
-    v_lo, v_hi = v_grid[idx_lo], v_grid[idx_hi]
-
-    # 5. Linear weight (when R_lo == R_hi, weight → 0)
-    w = torch.where(
-        R_hi == R_lo,
-        torch.zeros_like(R_lo),
-        (R_clamp - R_lo) / (R_hi - R_lo)
-    )
-
-    return v_lo + w * (v_hi - v_lo)
 
 class CubeSimulator(Module):
     """
@@ -124,8 +50,8 @@ class CubeSimulator(Module):
         SuperMAGE velocity field model
     intensity_model : Module
         SuperMAGE intensity/brightness field model
-    freqs : int
-        Final (downsampled) number of pixels along velocity dimension.
+    freqs : Tensor (1D)
+        Frequencies at which to evaluate the cube.
     velocity_upscale : int
         Factor by which velocity_res_out is multiplied. High internal resolution needed to prevent aliasing (rec. 5x).
     velocity_min, velocity_max : float
@@ -137,7 +63,7 @@ class CubeSimulator(Module):
     image_upscale : int
         Factor by which image_res_out is multiplied. High internal resolution can be needed to prevent aliasing.
     """
-    def __init__(self, velocity_model, intensity_model, freqs, systemic_or_redshift, frequency_upscale, cube_fov_half, image_res_out, image_upscale, radius_res, line="co21", device = "cuda", dtype = torch.float64):
+    def __init__(self, velocity_model, intensity_model, freqs, systemic_or_redshift, frequency_upscale, cube_fov_half, image_res_out, image_upscale, line="co21", device = "cuda", dtype = torch.float64):
         super().__init__()
         self.device = device
         self.dtype = dtype
@@ -149,20 +75,18 @@ class CubeSimulator(Module):
         self.sky_rot = Param("sky_rot", None)
         self.line_broadening = Param("line_broadening", None)
         self.velocity_shift = Param("velocity_shift", None)
-        #self.flux = Param("flux", None)
 
         # Determine whether we want systemic velocity or redshift
         self.systemic_or_redshift = systemic_or_redshift
         self.line = line
         
         # Internal resolutions
-        self.freq_res_out = len(freqs)
         self.image_res    = image_res_out * image_upscale
         self.frequency_upscale = frequency_upscale
         self.image_upscale    = image_upscale
 
         # Image grid        
-        self.pixelscale_pc = cube_fov_half*2/(image_res_out*image_upscale)
+        self.pixelscale_pc = cube_fov_half*2/(self.image_res)
         x_hi, dx_hi = make_spatial_axis(cube_fov_half, image_res_out, image_upscale,
                                 device=self.device, dtype=self.dtype)
         coords = torch.meshgrid(x_hi, x_hi, x_hi, indexing="ij")
@@ -171,33 +95,15 @@ class CubeSimulator(Module):
         # Frequency grid
         self.freqs = freqs
         self.v_z = torch.zeros_like(self.img_z, device = self.device)
-        
-        #delta = (self.freqs[-1] - self.freqs[0]) / (len(self.freqs) - 1)
-        #upsampled_step = delta / frequency_upscale
-        #n_upsampled = (len(self.freqs)-1)*frequency_upscale + 1
-        
-        #self.freqs_upsampled = self.freqs[0] + upsampled_step * torch.arange(n_upsampled, dtype=self.dtype, device=self.device)
-        #self.frequency_res = n_upsampled
-
-        self.freqs_upsampled, _ = make_frequency_axis(
-        self.freqs, self.frequency_upscale,
-        device=self.device, dtype=self.dtype)
+        self.freqs_upsampled, _ = make_frequency_axis(self.freqs, self.frequency_upscale, device=self.device, dtype=self.dtype)
         self.frequency_res = self.freqs_upsampled.numel()
-        
+
+        # Keops version of frequency grid
         cube_z_labels = self.freqs_upsampled * torch.ones((self.image_res, self.image_res, self.frequency_res), device = self.device, dtype = self.dtype)
         self.cube_z_l_keops = LazyTensor(cube_z_labels.unsqueeze(-1).expand(self.image_res, self.image_res, self.frequency_res, 1)[:, :, :, None, :])
-
-        # Output resolutions
-        # Freq_res_out defined in internal resolutions
-        self.image_res_out = image_res_out
-        #self.dv = (velocity_max_pc - velocity_min_pc) / self.velocity_res_out
-        #Calculate dv in the forward pass of visibility_cube model
-        self.dx = self.dy = 2*cube_fov_half/image_res_out
         
         # Constants
         self.pi = torch.tensor(pi, device = self.device)
-
-        self.radius_res = radius_res
 
     @forward
     def forward(
@@ -206,46 +112,27 @@ class CubeSimulator(Module):
     ):
         rot_x, rot_y, rot_z = DoRotation(self.img_x, self.img_y, self.img_z, inclination, sky_rot, device = self.device)
 
-        # cylindrical radii in the **galaxy** frame
-        R_map = torch.sqrt(rot_x**2 + rot_y**2)
-        Rmin = 0.1*self.pixelscale_pc
-        Rmax = R_map.max()
+        source_intensity_cube = self.intensity_model.brightness(rot_x, rot_y, rot_z)
+        intensity_cube = source_intensity_cube.unsqueeze(-1)
+        #del source_intensity_cube
+        torch.cuda.empty_cache()
 
-        R_grid = torch.logspace(np.log10(Rmin), np.log10(Rmax), self.radius_res,
-                        device=self.device, dtype=self.dtype)
-        
-        # one call to the heavy integrator
-        v_grid = self.velocity_model.velocity(R_grid, soft=Rmin)   # (NR,)
-
-        v_abs = interpolate_velocity(R_grid, R_map, v_grid)
-        # --------------------------------------------
-        
+        v_abs = self.velocity_model.velocity(rot_x, rot_y, rot_z)
         theta_rot = torch.atan2(rot_y, rot_x)
+        #del rot_x, rot_y, rot_z
+        torch.cuda.empty_cache()
+        
         v_x = -v_abs * torch.sin(theta_rot)
         v_y = v_abs * torch.cos(theta_rot)
+        #del v_abs, theta_rot
+        torch.cuda.empty_cache()
 
-        v_x_r, v_y_r, v_z_r = DoRotationT(v_x, v_y, self.v_z, inclination, sky_rot, device = self.device)
-        v_los_keops = LazyTensor(v_z_r.unsqueeze(-1).expand(self.image_res, self.image_res, self.image_res, 1)[:, :, None, :, :])
-
-        source_img_cube = self.intensity_model.brightness(rot_x, rot_y, rot_z)
-
-        intensity_cube = source_img_cube.unsqueeze(-1)
-        sig_sq = line_broadening**2
+        v_x_r, v_y_r, v_los_r = DoRotationT(v_x, v_y, self.v_z, inclination, sky_rot, device = self.device)
+        v_los_keops = LazyTensor(v_los_r.unsqueeze(-1).expand(self.image_res, self.image_res, self.image_res, 1)[:, :, None, :, :])
+        #del v_x, v_y, v_x_r, v_y_r, v_los_r
+        torch.cuda.empty_cache()
+        
         if self.systemic_or_redshift == "systemic":
-            velocity_labels_unshifted, _ = freq_to_vel_absolute_torch(self.freqs_upsampled, self.line, device = self.device, dtype = self.dtype)
-            upsampled_vs = velocity_labels_unshifted - velocity_shift
-            upsampled_vs_shaped = upsampled_vs.unsqueeze(0).unsqueeze(0)
-            
-            # Use average pooling to downsample
-            downsampled_vs = F.avg_pool1d(
-                upsampled_vs_shaped,
-                kernel_size=self.frequency_upscale,
-                stride=self.frequency_upscale
-            )
-            
-            # Shape => (frequency_res_out,)
-            downsampled_vs = downsampled_vs.squeeze(0).squeeze(0)
-            print(downsampled_vs)
             velocity_labels_unshifted, _ = freq_to_vel_absolute_torch(self.cube_z_l_keops, self.line, device = self.device, dtype = self.dtype) 
             velocity_labels = velocity_labels_unshifted - velocity_shift
         elif self.systemic_or_redshift == "redshift":
@@ -254,14 +141,25 @@ class CubeSimulator(Module):
         else:
             print("Please specify 'redshift' or 'systemic'")
             return
-        kde_dist = (-0.5*(velocity_labels - v_los_keops)**2 / sig_sq).exp()
-        cube = (kde_dist @ intensity_cube) * (1/torch.sqrt(2*self.pi*sig_sq))
+        
+        sig_sq = line_broadening**2
+        prob_density_matrix = (-0.5*(velocity_labels - v_los_keops)**2 / sig_sq).exp() # 2D probability density, axis 1 is output velocity grid, axis 2 is LOS position
+        cube = (prob_density_matrix @ intensity_cube) * (1/torch.sqrt(2*self.pi*sig_sq)) # Matrix inner product which results in a summation along axis 2 (LOS position)
+        #del prob_density_matrix, intensity_cube, v_los_keops
+        torch.cuda.empty_cache()
+        
         cube_final = torch.squeeze(cube)
-
+        #del cube
+        torch.cuda.empty_cache()
+        
         cube_final_3D = cube_final.permute(2, 0, 1)  # (frequency_res, image_res, image_res)
+        #del cube_final
+        torch.cuda.empty_cache()
 
         # Expand to (N=1, C=1, D, H, W)
         cube_5d = cube_final_3D.unsqueeze(0).unsqueeze(0)
+        #del cube_final_3D
+        torch.cuda.empty_cache()
 
         # Compute integer pooling sizes (assumes integral ratios)
         kernel_d = self.frequency_upscale
@@ -274,14 +172,10 @@ class CubeSimulator(Module):
             kernel_size=(kernel_d, kernel_h, kernel_w),
             stride=(kernel_d, kernel_h, kernel_w)
         )
+        #del cube_5d
+        torch.cuda.empty_cache()
         # Shape => (1, 1, frequency_res_out, image_res_out, image_res_out)
         cube_downsampled = cube_downsampled.squeeze(0).squeeze(0)
-
-        #raw_sum = cube_downsampled.sum().item()  # just the sum of array entries
-        #voxel_area = self.dx * self.dy * self.dv  # for line emission integrated in 3D
-        #flux_measured = raw_sum * voxel_area
-        #scale_factor = flux / flux_measured
-        #cube_downsampled *= scale_factor
         torch.cuda.empty_cache()
         return cube_downsampled
 
