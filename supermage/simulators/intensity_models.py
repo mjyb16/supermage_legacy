@@ -1,8 +1,23 @@
 import torch
 from caustics import Module, forward, Param
 
+class ExponentialDisk2D(Module):
+    """
+    Purely radial exponential surface–brightness profile for a razor-thin disk.
+    """
+    def __init__(self):
+        super().__init__()
+        self.scale = Param("scale", None)              # pc
 
-class ExponentialUnnorm(Module): #Rename to toroid?
+    @forward
+    def brightness(self, R_map, scale=None):
+        """
+        I(R) ∝ exp(−R / scale)
+        """
+        return torch.exp(-R_map / scale)               # (H,W)
+
+
+class ExponentialToroid(Module): #Formerly ExponentialUnnorm
     def __init__(self):
         super().__init__()
         self.sigma = Param("sigma", None)
