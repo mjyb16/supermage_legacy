@@ -63,102 +63,238 @@ def make_frequency_axis(freqs_coarse: torch.Tensor,
     return freqs_fine, Δf_fine
 
 
-def gaussian_blur_2d(cube_spatial,       # (D, H, W)   fine-grid cube
-                     sigma_px: float):
+
+
+
+
+def rotate_rect_phys(cube, angle_rad, U, U_y):
     """
-    Depth-wise separable Gaussian blur across (H, W).
-    cube_spatial : tensor of shape (D, H, W)
-    sigma_px     : σ in *fine* pixels (float, > 0)
-
-    Returns a blurred tensor of the same shape.
+    Rotate (D, H, W) without distortion, accounting for
+    - pixel aspect     (dx/dy = U / U_y)
+    - normalised-grid  anisotropy (W_p ≠ H_p)
     """
-    if sigma_px <= 0:
-        return cube_spatial                # safety early-exit
+    D, H, W = cube.shape
+    dev, dt = cube.device, cube.dtype
 
-    D, H, W          = cube_spatial.shape
-    dev, dt          = cube_spatial.device, cube_spatial.dtype
+    # 1. symmetric padding
+    pad = int(0.5*(math.sqrt(2)-1)*max(H, W)) + 2
+    cube_p = F.pad(cube, (pad, pad, pad, pad))     # (D, H_p, W_p)
+    H_p, W_p = H + 2*pad, W + 2*pad
 
-    # --- build 1-D Gaussian --------------------------------------------------
-    # kernel half-width:  ⌈3σ⌉ is plenty (covers 99.7 %)
-    half = int(math.ceil(3 * sigma_px))
-    k    = 2 * half + 1                     # full width  (odd)
-    x    = torch.arange(-half, half + 1, device=dev, dtype=dt)
-    g1d  = torch.exp(-0.5 * (x / sigma_px) ** 2)
-    g1d /= g1d.sum()                       # normalise to unit DC gain
+    # 2. scaling factor for off-diagonals in normalised coords
+    kappa = (U_y / U) * (H_p - 1) / (W_p - 1)      # ≥ 1
+    inv_k = 1.0 / kappa
 
-    # make depth-wise conv weights: shape (D,1,k,1) then (D,1,1,k)
-    gH = g1d.view(1, 1, k, 1).expand(D, 1, k, 1)
-    gW = g1d.view(1, 1, 1, k).expand(D, 1, 1, k)
+    a = -angle_rad
+    theta = cube.new_tensor([[ math.cos(a), -math.sin(a)*kappa , 0.0],
+                             [ math.sin(a)*inv_k ,  math.cos(a) , 0.0]])
 
-    # depth-wise separable convolution = two 1-D passes
-    cube = cube_spatial.unsqueeze(0)       # (1, D, H, W)
+    grid = F.affine_grid(theta.unsqueeze(0),
+                         size=(1, D, H_p, W_p),
+                         align_corners=True)
+    cube_big = F.grid_sample(cube_p.unsqueeze(0), grid,
+                             mode='bilinear',  # or 'nearest'
+                             padding_mode='border',
+                             align_corners=True).squeeze(0)
 
-    cube = F.conv2d(cube, gH, padding=(half, 0), groups=D)
-    cube = F.conv2d(cube, gW, padding=(0, half), groups=D)
+    # 3. centre-crop back to original rectangle
+    y0 = (H_p - H)//2
+    x0 = (W_p - W)//2
+    return cube_big[:, y0:y0+H, x0:x0+W]            # (D, H, W)
 
-    return cube.squeeze(0)                 # (D, H, W)
 
-def lanczos_blur_2d(cube_spatial,
-                    sigma_px: float,
-                    a: int = 3):            # Lanczos order: 2 or 3 usual
-    """
-    cube_spatial : (D, H, W)   fine-grid cube
-    sigma_px     : target σ in FINE pixels  (float > 0)
-    a            : size of the Lanczos window (integer ≥ 2)
 
-    Returns tensor of same shape (D, H, W)
-    """
-    if sigma_px <= 0:
-        return cube_spatial                     # early exit (no blur)
+class MinMajThinCubeSimulator(Module):
+    def __init__(
+        self,
+        velocity_model,
+        intensity_model,
+        freqs,
+        systemic_or_redshift,
+        frequency_upscale,
+        cube_fov_half,
+        image_res_out,
+        major_upscale,
+        minor_upscale,
+        line="co21",
+        device="cuda",
+        dtype=torch.float64,
+    ):
+        super().__init__()
+        self.device, self.dtype = device, dtype
+        self.velocity_model = velocity_model
+        self.intensity_model = intensity_model
 
-    D, H, W   = cube_spatial.shape
-    dev, dt   = cube_spatial.device, cube_spatial.dtype
+        # free parameters that can be fitted
+        self.inclination     = Param("inclination", None)   # rad
+        self.sky_rot         = Param("sky_rot", None)       # rad
+        self.line_broadening = Param("line_broadening", None)
+        self.velocity_shift  = Param("velocity_shift", None)
 
-    # --- build 1-D Lanczos kernel (length k) ------------------------------
-    g1d = lanczos_kernel_1d(a=a,
-                            sigma_px=sigma_px,
-                            device=dev,
-                            dtype=dt)
-    k   = g1d.numel()                           # *actual* kernel length
+        # bookkeeping
+        self.systemic_or_redshift = systemic_or_redshift
+        self.line = line
 
-    # depth-wise weights: (out_ch = D, in_ch = 1, k, 1) and (D,1,1,k)
-    gH = g1d.view(1, 1, k, 1).expand(D, 1, k, 1).contiguous()
-    gW = g1d.view(1, 1, 1, k).expand(D, 1, 1, k).contiguous()
+        # -------------------------------------------------------
+        # INTERNAL RESOLUTIONS
+        # -------------------------------------------------------
+        self.frequency_upscale = frequency_upscale
+        self.image_upscale     = major_upscale#image_upscale
+        self.N_out   = image_res_out        # coarse pixels along one axis
+        self.side_hi = self.N_out * minor_upscale  # fine-grid side length after rotation
 
-    cube = cube_spatial.unsqueeze(0)            # (1, D, H, W)
+        # -------------------------------------------------------
+        # 2-D IMAGE GRID  (x_img, y_img)
+        # -------------------------------------------------------
+        # NB:  Thin disk ⇒ no need to carry a z-axis in memory
+        #self.pixelscale_pc = 2 * cube_fov_half / self.image_res             # pc / fine-pixel
+        #x_hi, _ = make_spatial_axis(
+        #    cube_fov_half,
+        #    image_res_out,
+        #    image_upscale,
+        #    device=self.device,
+        #    dtype=self.dtype,
+        #)
+        # sky-plane meshgrid (shape: H×W)
+        #self.img_x, self.img_y = torch.meshgrid(x_hi, x_hi, indexing="ij")  # (H, W)
 
-    # first horizontal, then vertical pass
-    half = (k - 1) // 2
-    cube = F.conv2d(cube, gH, padding=(half, 0), groups=D)
-    cube = F.conv2d(cube, gW, padding=(0, half), groups=D)
+        self.U   = major_upscale                 # e.g. 2 or 3
+        self.U_y = minor_upscale   # Nyquist along minor axis
+        
+        dx_coarse = 2 * cube_fov_half / image_res_out
+        x_hi, _   = make_spatial_axis(
+            cube_fov_half,
+            image_res_out,
+            self.U,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        y_hi, _   = make_spatial_axis(
+            cube_fov_half,
+            image_res_out,
+            self.U_y,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        self.H_gal = x_hi.numel()        # = N_out * U
+        self.W_gal = y_hi.numel()        # = N_out * U_y
+        self.x_gal, self.y_gal = torch.meshgrid(x_hi, y_hi, indexing="ij")
 
-    return cube.squeeze(0)
+        # -------------------------------------------------------
+        # FREQUENCY GRID  (no change)
+        # -------------------------------------------------------
+        self.freqs = freqs                                              # coarse axis (1-D)
+        self.freqs_upsampled, _ = make_frequency_axis(                  # fine axis (1-D)
+            self.freqs,
+            self.frequency_upscale,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        self.frequency_res = self.freqs_upsampled.numel()               # D_fine
 
-def lanczos_kernel_1d(a: int, sigma_px: float, device, dtype):
-    """
-    Build a 1-D Lanczos window of radius `a` (a = 2 or 3 recommended),
-    whose main-lobe standard deviation matches `sigma_px`.
+        # -------------------------------------------------------
+        # KeOps LazyTensor holding ν labels, broadcast over pixels
+        # -------------------------------------------------------
+        # We need a 3-D tensor of shape (H, W, D_fine, 1) for KeOps
+        cube_z_labels = self.freqs_upsampled.view(1, 1, -1, 1)           # (1,1,D,1)
+        cube_z_labels = self.freqs_upsampled.view(1, 1, -1, 1).expand(
+            self.H_gal, self.W_gal, -1, 1)          # use rectangular H×W here
+        Dν = self.frequency_res
+        self.cube_nu_keops = LazyTensor(          # shape (1,1,Dν,1)
+            self.freqs_upsampled.view(1, 1, Dν, 1)
+        )
 
-    Returns tensor of shape (2*a+1,)
-    """
-    # Radius in *fine* pixels that corresponds to the requested σ
-    R = sigma_px * math.sqrt(2 * math.pi)
-    # Use at most 'a' lobes to keep the kernel compact
-    half = int(min(a * R, 3 * a))          # cap width if σ too large
+        # -------------------------------------------------------
+        # CONSTANTS
+        # -------------------------------------------------------
+        self.pi = torch.tensor(np.pi, device=self.device, dtype=self.dtype)
 
-    x = torch.arange(-half, half + 1, device=device, dtype=dtype)
-    # sinc(x) = sin(pi x)/(pi x)  ;  avoid div-by-zero at x=0
-    sinc = torch.where(x == 0,
-                       torch.ones_like(x),
-                       torch.sin(math.pi * x / R) / (math.pi * x / R))
-    lanc = torch.where(x == 0,
-                       torch.ones_like(x),
-                       torch.sin(math.pi * x / a) / (math.pi * x / a))
+        # Make sure the downstream models can “see” the inclination
+        self.velocity_model.inc = self.inclination
 
-    k = sinc * lanc
-    k /= k.sum()                           # DC-gain = 1
-    return k
+    @forward
+    def forward(
+        self,
+        inclination=None,
+        sky_rot=None,
+        line_broadening=None,
+        velocity_shift=None,
+    ):
+        """
+        Thin-disk forward model – *dense* PyTorch version
+        (no KeOps, so easier to debug).
+        Returns
+        -------
+        cube_downsampled : Tensor  (N_freq_out, H_out, W_out)
+        """
     
+        # ---------------------------------------------------------------
+        # 1.  SKY  →  GALAXY radius
+        # ---------------------------------------------------------------
+        #x_sky, y_sky = self.img_x, self.img_y
+        #cos_pa, sin_pa = torch.cos(sky_rot), torch.sin(sky_rot)
+        cos_i,  sin_i  = torch.cos(inclination), torch.sin(inclination)
+    
+        # CCW rotation by PA  (φ measured from +y (North) through +x (East))
+        #x_rot =  cos_pa * x_sky - sin_pa * y_sky
+        #y_rot =  sin_pa * x_sky + cos_pa * y_sky
+        y_gal = self.y_gal / cos_i
+        x_gal = self.x_gal
+    
+        R_map     = torch.sqrt(x_gal**2 + y_gal**2 + 1e-12)   # (H,W)
+        cos_theta = x_gal / R_map
+    
+        # ---------------------------------------------------------------
+        # 2.  INTENSITY  I(R)
+        # ---------------------------------------------------------------
+        I_pix = self.intensity_model.brightness(R_map)        # (H,W)
+    
+        # ---------------------------------------------------------------
+        # 3.  VELOCITY  v_rot(R)  and line-of-sight projection
+        # ---------------------------------------------------------------
+        v_rot = self.velocity_model.velocity(R_map)           # (H,W)
+        v_los = v_rot * sin_i * cos_theta                     # (H,W)
+    
+        # ---------------------------------------------------------------
+        # 4.  FREQUENCY axis  → velocity labels (1-D)
+        # ---------------------------------------------------------------
+        v_labels_1d, _ = freq_to_vel_absolute_torch(
+            self.freqs_upsampled, self.line,
+            device=self.device, dtype=self.dtype
+        )                         # shape (Dν,)
+    
+        v_labels_1d = v_labels_1d - velocity_shift            # systemic shift
+    
+        # broadcast to (H,W,Dν)
+        v_labels = v_labels_1d.view(1, 1, -1).expand(self.H_gal, self.W_gal, -1)
+        v_los_b  = v_los.unsqueeze(-1)                        # (H,W,1)
+    
+        # ---------------------------------------------------------------
+        # 5.  GAUSSIAN broadening
+        # ---------------------------------------------------------------
+        sig2 = line_broadening ** 2
+        norm = 1.0 / torch.sqrt(2 * self.pi * sig2)
+    
+        pdf = torch.exp(-0.5 * (v_labels - v_los_b) ** 2 / sig2)  # (H,W,Dν)
+        cube_hi = pdf * I_pix.unsqueeze(-1) * norm                # (H,W,Dν)
+    
+        # ---------------------------------------------------------------
+        # 6.  Re-order axes & downsample
+        # ---------------------------------------------------------------
+        cube_hi = cube_hi.permute(2, 0, 1)        # (Dν, H, W)
+        
+        # (i) rotate directly with physical aspect ratio
+        cube_rot = rotate_rect_phys(cube_hi, sky_rot, self.U, self.U_y)
+        
+        # (ii) final 3-D pooling to coarse cube
+        cube_5d  = cube_rot.unsqueeze(0).unsqueeze(0)
+        cube_ds  = F.avg_pool3d(
+                      cube_5d,
+                      kernel_size=(self.frequency_upscale, self.U, self.U_y),
+                      stride     =(self.frequency_upscale, self.U, self.U_y)
+                  ).squeeze(0).squeeze(0)          # (N_freq_out, N_out, N_out)
+        
+        return cube_ds
 
 class ThinCubeSimulator(Module):
     def __init__(
@@ -316,8 +452,6 @@ class ThinCubeSimulator(Module):
         # ---------------------------------------------------------------
         # 6.  Re-order axes & downsample
         # ---------------------------------------------------------------
-        sigma_px = 0.5 * self.image_upscale       # ≃ 0.5 coarse pixel
-        cube_hi  = lanczos_blur_2d(cube_hi, sigma_px)
         cube_hi = cube_hi.permute(2, 0, 1)          # (Dν, H, W)
         cube_5d = cube_hi.unsqueeze(0).unsqueeze(0) # (1,1,D,H,W)
     
