@@ -102,6 +102,214 @@ def rotate_rect_phys(cube, angle_rad, U, U_y):
     x0 = (W_p - W)//2
     return cube_big[:, y0:y0+H, x0:x0+W]            # (D, H, W)
 
+class MinMajThinCubeSimulatorKeOps(Module):
+    def __init__(
+        self,
+        velocity_model,
+        intensity_model,
+        freqs,
+        systemic_or_redshift,
+        frequency_upscale,
+        cube_fov_half,
+        image_res_out,
+        major_upscale,
+        minor_upscale,
+        line="co21",
+        device="cuda",
+        dtype=torch.float64,
+    ):
+        super().__init__()
+        self.device, self.dtype = device, dtype
+        self.velocity_model = velocity_model
+        self.intensity_model = intensity_model
+
+        # free parameters that can be fitted
+        self.inclination     = Param("inclination", None)   # rad
+        self.sky_rot         = Param("sky_rot", None)       # rad
+        self.line_broadening = Param("line_broadening", None)
+        self.velocity_shift  = Param("velocity_shift", None)
+
+        # bookkeeping
+        self.systemic_or_redshift = systemic_or_redshift
+        self.line = line
+
+        # -------------------------------------------------------
+        # INTERNAL RESOLUTIONS
+        # -------------------------------------------------------
+        self.frequency_upscale = frequency_upscale
+        self.image_upscale     = major_upscale
+        self.N_out   = image_res_out        # coarse pixels along one axis
+        self.side_hi = self.N_out * minor_upscale  # fine-grid side length after rotation
+
+        # -------------------------------------------------------
+        # 2-D IMAGE GRID  (x_img, y_img)
+        # -------------------------------------------------------
+        self.U   = major_upscale                 # e.g. 2 or 3
+        self.U_y = minor_upscale   # Nyquist along minor axis
+        
+        dx_coarse = 2 * cube_fov_half / image_res_out
+        x_hi, _   = make_spatial_axis(
+            cube_fov_half,
+            image_res_out,
+            self.U,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        y_hi, _   = make_spatial_axis(
+            cube_fov_half,
+            image_res_out,
+            self.U_y,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        self.H_gal = x_hi.numel()        # = N_out * U
+        self.W_gal = y_hi.numel()        # = N_out * U_y
+        self.x_gal, self.y_gal = torch.meshgrid(x_hi, y_hi, indexing="ij")
+
+        # -------------------------------------------------------
+        # FREQUENCY GRID  (no change)
+        # -------------------------------------------------------
+        self.freqs = freqs                                              # coarse axis (1-D)
+        self.freqs_upsampled, _ = make_frequency_axis(                  # fine axis (1-D)
+            self.freqs,
+            self.frequency_upscale,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        self.frequency_res = self.freqs_upsampled.numel()               # D_fine
+
+        # -------------------------------------------------------
+        # KeOps LazyTensor setup for memory-efficient operations
+        # -------------------------------------------------------
+        # Create LazyTensors for spatial coordinates
+        # Flatten spatial coordinates for KeOps operations
+        x_flat = self.x_gal.flatten()  # (H*W,)
+        y_flat = self.y_gal.flatten()  # (H*W,)
+        
+        # Create LazyTensors with proper dimensions and axis specifications
+        # axis=0 means these are "i" variables (spatial pixels)
+        self.x_keops = LazyTensor(x_flat.view(-1, 1), axis=0)
+        self.y_keops = LazyTensor(y_flat.view(-1, 1), axis=0)
+        
+        # For frequency/velocity labels, we'll create them in the forward pass
+        # since they depend on velocity_shift parameter
+
+        # -------------------------------------------------------
+        # CONSTANTS
+        # -------------------------------------------------------
+        self.pi = torch.tensor(np.pi, device=self.device, dtype=self.dtype)
+
+        # Make sure the downstream models can "see" the inclination
+        self.velocity_model.inc = self.inclination
+
+    @forward
+    def forward(
+        self,
+        inclination=None,
+        sky_rot=None,
+        line_broadening=None,
+        velocity_shift=None,
+    ):
+        """
+        Thin-disk forward model using KeOps for memory-efficient operations
+        """
+        
+        # ---------------------------------------------------------------
+        # 1.  SKY  →  GALAXY radius (using KeOps for memory efficiency)
+        # ---------------------------------------------------------------
+        cos_i, sin_i = torch.cos(inclination), torch.sin(inclination)
+        
+        # Create LazyTensors for transformed coordinates
+        y_gal_keops = self.y_keops / cos_i
+        x_gal_keops = self.x_keops
+        
+        # Compute R_map using KeOps
+        R_map_keops = (x_gal_keops**2 + y_gal_keops**2 + 1e-12).sqrt()  # (H*W, 1)
+        cos_theta_keops = x_gal_keops / R_map_keops
+        
+        # ---------------------------------------------------------------
+        # 2.  INTENSITY  I(R) - evaluate and flatten
+        # ---------------------------------------------------------------
+        # Materialize R_map using sum reduction (forces evaluation)
+        R_map_flat = R_map_keops.sum(dim=1)  # This forces materialization: (H*W,)
+        R_map_dense = R_map_flat.view(self.H_gal, self.W_gal)  # reshape to (H,W)
+        I_pix = self.intensity_model.brightness(R_map_dense)  # (H,W)
+        I_pix_flat = I_pix.flatten()  # (H*W,)
+        I_pix_keops = LazyTensor(I_pix_flat.view(-1, 1), axis=0)  # (H*W, 1)
+        
+        # ---------------------------------------------------------------
+        # 3.  VELOCITY  v_rot(R)  and line-of-sight projection
+        # ---------------------------------------------------------------
+        # Similarly, materialize for velocity model evaluation
+        v_rot_dense = self.velocity_model.velocity(R_map_dense)  # (H,W)
+        v_rot_flat = v_rot_dense.flatten()  # (H*W,)
+        v_rot_keops = LazyTensor(v_rot_flat.view(-1, 1), axis=0)  # (H*W, 1)
+        
+        # Materialize cos_theta for line-of-sight velocity computation
+        cos_theta_flat = cos_theta_keops.sum(dim=1)  # materialize: (H*W,)
+        cos_theta_keops_mat = LazyTensor(cos_theta_flat.view(-1, 1), axis=0)  # (H*W, 1)
+        
+        # Line-of-sight velocity using KeOps
+        v_los_keops = v_rot_keops * sin_i * cos_theta_keops_mat  # (H*W, 1)
+        
+        # ---------------------------------------------------------------
+        # 4.  FREQUENCY axis  → velocity labels (1-D)
+        # ---------------------------------------------------------------
+        v_labels_1d, _ = freq_to_vel_absolute_torch(
+            self.freqs_upsampled, self.line,
+            device=self.device, dtype=self.dtype
+        )                         # shape (Dν,)
+        
+        v_labels_1d = v_labels_1d - velocity_shift            # systemic shift
+        # axis=1 means this is a "j" variable (frequency/velocity channels)
+        v_labels_keops = LazyTensor(v_labels_1d.view(1, -1), axis=1)  # (1, Dν)
+        
+        # ---------------------------------------------------------------
+        # 5.  GAUSSIAN broadening using KeOps (THIS IS THE KEY IMPROVEMENT)
+        # ---------------------------------------------------------------
+        sig2 = line_broadening ** 2
+        norm = 1.0 / torch.sqrt(2 * self.pi * sig2)
+        
+        # Memory-efficient Gaussian computation using KeOps
+        # v_labels_keops: (1, Dν) with axis=1, v_los_keops: (H*W, 1) with axis=0
+        # The subtraction broadcasts to (H*W, Dν)
+        diff_keops = v_labels_keops - v_los_keops  # (H*W, Dν)
+        
+        # Gaussian PDF computation
+        pdf_keops = (-0.5 * diff_keops**2 / sig2).exp()  # (H*W, Dν)
+        
+        # Multiply by intensity and normalization
+        cube_keops = pdf_keops * I_pix_keops * norm  # (H*W, Dν)
+        
+        # ---------------------------------------------------------------
+        # 6.  Materialize the result and reshape
+        # ---------------------------------------------------------------
+        # Materialize the LazyTensor by using a reduction operation
+        # We'll use a dummy variable to force evaluation
+        dummy_var = LazyTensor(torch.ones(1, 1, device=self.device, dtype=self.dtype), axis=1)
+        cube_materialized = (cube_keops * dummy_var).sum(dim=1)  # (H*W, Dν)
+        
+        # Reshape to the expected cube format
+        cube_hi = cube_materialized.view(self.H_gal, self.W_gal, -1)  # (H, W, Dν)
+        
+        # ---------------------------------------------------------------
+        # 7.  Re-order axes & downsample
+        # ---------------------------------------------------------------
+        cube_hi = cube_hi.permute(2, 0, 1)        # (Dν, H, W)
+        
+        # (i) rotate directly with physical aspect ratio
+        cube_rot = rotate_rect_phys(cube_hi, sky_rot, self.U, self.U_y)
+        
+        # (ii) final 3-D pooling to coarse cube
+        cube_5d  = cube_rot.unsqueeze(0).unsqueeze(0)
+        cube_ds  = F.avg_pool3d(
+                      cube_5d,
+                      kernel_size=(self.frequency_upscale, self.U, self.U_y),
+                      stride     =(self.frequency_upscale, self.U, self.U_y)
+                  ).squeeze(0).squeeze(0)          # (N_freq_out, N_out, N_out)
+        
+        return cube_ds
+
 
 
 class MinMajThinCubeSimulator(Module):
