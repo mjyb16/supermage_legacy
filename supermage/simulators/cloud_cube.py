@@ -161,3 +161,146 @@ class CloudCatalog(Module):
                 "vel_chan": vel_chan,  # (N,K)
                 "flux":     flux_sub,  # (N,K)
             }
+
+
+
+class CloudRasterizer(Module):
+    """
+    Deposit (N,K) cloudlets onto a data cube on a fixed 3-D Cartesian grid
+    using *trilinear* weights in X and Y and linear weights in velocity.
+
+    Inputs (passed to forward):
+    ---------------------------
+    pos_img   : (N,K,2)  sky coords  [arcsec]
+    vel_chan  : (N,K)    LOS vel     [km/s]
+    flux      : (N,K)    flux        [arb.]
+
+    Parameters (constant):
+    ----------------------
+    vel_axis  : (Nv,)    channel centres [km/s] – **must be equally spaced**
+    pixscale  : float    arcsec / pixel  (square pixels)
+    N_pix     : int      final coarse resolution  (Ny = Nx = N_pix)
+    fov_half  : float    ±arcsec covered by pixel grid  (same as catalogue)
+    """
+    def __init__(
+        self,
+        cloudcatalog,
+        vel_axis: torch.Tensor,   # (Nv,)
+        pixscale: float,
+        N_pix: int,
+        fov_half: float,
+        device="cuda",
+        dtype=torch.float32,
+        name="raster",
+    ):
+        super().__init__(name=name)
+        self.device, self.dtype = device, dtype
+
+        # -------- velocity axis checks -------------------------------
+        if not torch.allclose(
+                vel_axis[1:] - vel_axis[:-1],
+                vel_axis[1]  - vel_axis[0]):
+            raise ValueError("vel_axis must be uniformly spaced for this rasteriser.")
+        self.vel0 = vel_axis[0].to(dtype)
+        self.dv = float((vel_axis[1] - vel_axis[0]).item())      # Δv scalar
+        self.Nv = vel_axis.numel()
+
+        # -------- spatial grid constants -----------------------------
+        self.pixscale = pixscale
+        self.N_pix    = N_pix
+        self.fov_half = fov_half
+
+        # -------- Input clouds ---------------------------------------
+        self.clouds = cloudcatalog
+
+    # -----------------------------------------------------------------
+    # helper to convert coordinate → lower index & fractional part -----
+    # -----------------------------------------------------------------
+    @staticmethod
+    def _index_and_frac(x):
+        """Return floor(x) (long) and fractional part (same dtype as x)."""
+        i0 = torch.floor(x).to(torch.long)
+        frac = x - i0.to(x.dtype)
+        return i0, frac
+
+    # -----------------------------------------------------------------
+    @forward
+    def forward(self):
+        """
+        Returns  cube  (Nv, N_pix, N_pix)   with same dtype as `flux`.
+        """
+        pos_img, vel_chan, flux = self.cloudcatalog.forward(return_subsamples = True)
+        # ----------------------------------------------------------------
+        # 0) reshape helpers --------------------------------------------
+        # ----------------------------------------------------------------
+        N, K, _ = pos_img.shape
+        flat_len = N * K                                  # total cloudlets
+        x = pos_img[..., 0].reshape(flat_len)             # (M,)
+        y = pos_img[..., 1].reshape(flat_len)             # (M,)
+        v = vel_chan.reshape(flat_len)                    # (M,)
+        f = flux.reshape(flat_len)                        # (M,)
+
+        # ----------------------------------------------------------------
+        # 1) normalised coordinates → pixel/channel indices --------------
+        # ----------------------------------------------------------------
+        # spatial
+        x_pix = (x + self.fov_half) / self.pixscale       # (M,)
+        y_pix = (y + self.fov_half) / self.pixscale
+        ix0, fx = self._index_and_frac(x_pix)             # floor + frac
+        iy0, fy = self._index_and_frac(y_pix)
+
+        # velocity
+        v_pix = (v - self.vel0) / self.dv
+        iv0, fv = self._index_and_frac(v_pix)
+
+        # clip neighbours that would fall outside the cube ----------------
+        mask = (
+            (ix0 >= 0) & (ix0 < self.N_pix - 1) &
+            (iy0 >= 0) & (iy0 < self.N_pix - 1) &
+            (iv0 >= 0) & (iv0 < self.Nv    - 1)
+        )
+
+        if mask.sum() == 0:
+            # nothing lands inside – rare but handle gracefully
+            return torch.zeros(self.Nv, self.N_pix, self.N_pix,
+                               device=self.device, dtype=f.dtype)
+
+        ix0, iy0, iv0 = ix0[mask], iy0[mask], iv0[mask]
+        fx,  fy,  fv  = fx [mask], fy [mask], fv [mask]
+        f             = f  [mask]
+
+        # neighbours ------------------------------------------------------
+        ix1, iy1, iv1 = ix0 + 1, iy0 + 1, iv0 + 1
+        wx0, wy0, wv0 = 1 - fx, 1 - fy, 1 - fv
+        wx1, wy1, wv1 =     fx,     fy,     fv
+
+        # ----------------------------------------------------------------
+        # 2) assemble 8-neighbour contributions --------------------------
+        # ----------------------------------------------------------------
+        # shape each vector to (M,1) so broadcasting produces (M,8)
+        ix = torch.stack([ix0, ix0, ix0, ix0, ix1, ix1, ix1, ix1], dim=1)  # (M,8)
+        iy = torch.stack([iy0, iy0, iy1, iy1, iy0, iy0, iy1, iy1], dim=1)
+        iv = torch.stack([iv0, iv1, iv0, iv1, iv0, iv1, iv0, iv1], dim=1)
+
+        wx = torch.stack([wx0, wx0, wx0, wx0, wx1, wx1, wx1, wx1], dim=1)
+        wy = torch.stack([wy0, wy1, wy0, wy1, wy0, wy1, wy0, wy1], dim=1)
+        wv = torch.stack([wv0, wv0, wv0, wv0, wv0, wv0, wv0, wv0], dim=1) + \
+             torch.stack([0,   fv,  0,   fv,  0,   fv,  0,   fv ], dim=1)  # elegant trick
+
+        w = wx * wy * wv                                                  # (M,8)
+        f_w = f.unsqueeze(1) * w                                          # (M,8)
+
+        # flatten all contributions --------------------------------------
+        idx_flat = (iv * self.N_pix + iy) * self.N_pix + ix               # (M,8)
+        idx_flat = idx_flat.reshape(-1)
+        f_w      = f_w.reshape(-1)
+
+        # ----------------------------------------------------------------
+        # 3) scatter-add into cube buffer --------------------------------
+        # ----------------------------------------------------------------
+        cube_flat = torch.zeros(self.Nv * self.N_pix * self.N_pix,
+                                device=self.device, dtype=f.dtype)
+        cube_flat = cube_flat.scatter_add(0, idx_flat, f_w)
+
+        cube = cube_flat.view(self.Nv, self.N_pix, self.N_pix)
+        return cube
