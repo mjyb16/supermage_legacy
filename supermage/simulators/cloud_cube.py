@@ -261,6 +261,10 @@ class CloudRasterizer(Module):
 
 
 class CloudRasterizerOversample(Module):
+    """
+    Recommended rasterizer for cloud-based models. 
+    Oversamples along velocity and position axis to ensure Nyquist sampling of spatio-spectral variations.
+    """
     # ──────────────────────────────────────────────────────────────────
     def __init__(self,
                  cloudcatalog,
