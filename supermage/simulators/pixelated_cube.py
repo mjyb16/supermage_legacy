@@ -678,6 +678,7 @@ class ThinCubeSimulator(Module):
 
 class ThickCubeSimulator(Module):
     """
+    Warning: different parallactic angle convention (for now)!
     Parameters for init
     ----------
     velocity_model : Module

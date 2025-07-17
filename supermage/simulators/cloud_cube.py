@@ -1,6 +1,7 @@
 import math, torch
 from caskade import Module, Param, forward            # same import style you use
 import torch.nn.functional as F
+from supermage.utils.cube_tools import create_velocity_grid_stable
 # ----------------------------------------------------------------------
 # Helper: equal-probability Gaussian abscissae -------------------------
 # ----------------------------------------------------------------------
@@ -56,20 +57,6 @@ class CloudCatalog(Module):
             )
             # draw in [-1,1]^2 then scale to pc
             self.pos_gal0 = (sobol.draw(int(N_clouds), dtype = dtype) * 2.0 - 1.0) * fov_half_pc
-
-        elif sampling_method == "proportional":
-            # existing rejection sampler (unchanged) --------------------
-            gen = torch.Generator(device).manual_seed(seed)
-            I0  = self.intensity_model.brightness(0.0, brightness_init)
-            pts = []
-            while len(pts) < N_clouds:
-                xy = (torch.rand(2, device=device, dtype=dtype, generator=gen) * 2 - 1) \
-                     * fov_half_pc
-                R  = torch.hypot(*xy)
-                if torch.rand(1, generator=gen).item() * I0 <= \
-                        self.intensity_model.brightness(R, brightness_init):
-                    pts.append(xy)
-            self.pos_gal0 = torch.stack(pts)                      # (N,2) pc
 
         elif sampling_method == "uniform":
             # existing pure‑uniform sampler (unchanged) -----------------
@@ -180,22 +167,24 @@ class CloudRasterizer(Module):
     def __init__(
         self,
         cloudcatalog,
-        vel_axis,                 # (Nv,) uniform
+        freq_axis,                 # (Nv,) uniform
         pixel_scale_arcsec,       # ″ / pix  (positive)
         N_pix_x,                  # = NAXIS1
         device="cuda",
         dtype=torch.float32,
+        line = "co21",
         name="raster",
     ):
         super().__init__(name)
         self.device, self.dtype = device, dtype
 
         # velocity axis -------------------------------------------------
+        vel_axis, dv = create_velocity_grid_stable(f_start = freq_axis[0], f_end = freq_axis[-1], num_points = len(freq_axis), target_dtype = dtype, line = line)
         if not torch.allclose(vel_axis[1:] - vel_axis[:-1],
                               vel_axis[1]  - vel_axis[0]):
             raise ValueError("vel_axis must be uniformly spaced.")
-        self.vel0 = vel_axis[0].to(dtype)
-        self.dv   = float((vel_axis[1] - vel_axis[0]).item())
+        self.vel0 = vel_axis[0]
+        self.dv   = float(dv.item())
         self.Nv   = vel_axis.numel()
 
         # spatial grid --------------------------------------------------
@@ -268,13 +257,14 @@ class CloudRasterizerOversample(Module):
     # ──────────────────────────────────────────────────────────────────
     def __init__(self,
                  cloudcatalog,
-                 vel_axis,              # (Nv,) uniform
+                 freq_axis,              # (Nv,) uniform
                  pixel_scale_arcsec,
                  N_pix_x,
                  oversamp_xy: int = 4,
                  oversamp_v : int = 4,   # NEW: velocity oversampling
                  device: str = "cuda",
                  dtype : torch.dtype = torch.float32,
+                 line = "co21",
                  name  : str = "raster"):
         super().__init__()
         self.device, self.dtype = device, dtype
@@ -282,7 +272,9 @@ class CloudRasterizerOversample(Module):
         self.oversamp_xy = int(oversamp_xy)
         self.oversamp_v  = int(oversamp_v)
 
-        # ── low‑res velocity grid (given) ────────────────────────────
+        # ── low‑res velocity grid ────────────────────────────
+        # velocity axis -------------------------------------------------
+        vel_axis, dv = create_velocity_grid_stable(f_start = freq_axis[0], f_end = freq_axis[-1], num_points = len(freq_axis), target_dtype = dtype, line = line)
         if not torch.allclose(vel_axis[1:] - vel_axis[:-1],
                               vel_axis[1]  - vel_axis[0]):
             raise ValueError("vel_axis must be uniformly spaced.")

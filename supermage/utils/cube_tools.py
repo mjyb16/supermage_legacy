@@ -40,6 +40,7 @@ def dirty_cube_tool(vis_bin_re_cube, vis_bin_imag_cube, roi_start, roi_end):
     dirty_cube = np.stack(dirty_cube, axis=-1)
     return dirty_cube
 
+
 # Eric's mask making code
 def smooth_mask(cube, sigma = 2, hann = 5, clip = 0.0002):  # updated by Eric
     """
@@ -57,52 +58,85 @@ def smooth_mask(cube, sigma = 2, hann = 5, clip = 0.0002):  # updated by Eric
     print('final mask sum',np.sum(mask))
     return mask_iter.T
 
-def freq_to_vel_systemic(freq, systemic_velocity, line = "co21"):
-    """
-    Return velocity offsets (in km/s) relative to a systemic velocity (in km/s)
-    given an array of frequencies (in GHz).
-    """
-    # Speed of light in km/s
-    c = const.c.value/1e3
-    # Rest frequency of the CO(2-1) line in Hz
-    co21_rest_freq = 230.538
-    if line == "co21":
-        blueshifted_co21_freq = co21_rest_freq * (1 - systemic_velocity / c)
-        velocities = c * (1 - freq / co21_rest_freq) - systemic_velocity
-        return velocities, blueshifted_co21_freq
 
-def freq_to_vel_systemic_torch(freq, systemic_velocity, line = "co21", device = "cuda", dtype = torch.float64):
+def create_velocity_grid_stable(
+    f_start: float,
+    f_end: float,
+    num_points: int,
+    target_dtype = torch.float32,
+    line = "co21"
+):
     """
-    Return velocity offsets (in km/s) relative to a systemic velocity (in km/s)
-    given an array of frequencies (in GHz).
+    Creates a velocity grid using a numerically stable approach.
+
+    This method works by recognizing the frequency-to-velocity conversion is a
+    linear transformation (v = A*f + B). It calculates the start velocity and
+    the velocity step size using high-precision float64, then constructs the
+    final grid using the target dtype (e.g., float32). This avoids all
+    cumulative precision errors.
+
+    Returns:
+        A tuple containing (final velocity grid, velocity steps).
     """
-    # Speed of light in km/s
-    c = torch.tensor(const.c.value, dtype = dtype, device = device)/1e3
-    # Rest frequency of the CO(2-1) line in Hz
-    co21_rest_freq = torch.tensor(230.538, dtype = dtype, device = device)
-    if line == "co21":
-        blueshifted_co21_freq = co21_rest_freq * (1 - systemic_velocity / c)
-        velocities = c * (1 - freq / co21_rest_freq) - systemic_velocity
-        return velocities, blueshifted_co21_freq
+    # --- Step 1: Define grid parameters in HIGH PRECISION (float64) ---
+    f_start_64 = torch.tensor(f_start, dtype=torch.float64)
+    f_end_64 = torch.tensor(f_end, dtype=torch.float64)
+    df_64 = (f_end_64 - f_start_64) / (num_points - 1)
 
-def freq_to_vel_absolute_torch(freq, line="co21", device="cuda", dtype = torch.float64):
-    c = torch.tensor(const.c.value, dtype=dtype, device=device) / 1e3
-    co21_rest_freq = torch.tensor(230.538, dtype=dtype, device=device)
-    velocities = -c * (freq - co21_rest_freq) / co21_rest_freq
-    return velocities, co21_rest_freq
-
-def velocity_map_torch(cube, velocities):      
-    # Calculate intensity-weighted average velocity
-    vel_map = torch.sum(cube * velocities[None, None, :], dim=2) / torch.sum(cube, dim=2)
+    # --- Step 2: Calculate v_start and delta_v in HIGH PRECISION ---
+    # The transformation is v(f) = A*f + B, so a uniform freq grid (f_i = f_start + i*df)
+    # becomes a uniform velocity grid (v_i = v_start + i*delta_v).
     
+    # Calculate v_start = v(f_start_64)
+    v_start_64 = freq_to_vel_absolute(f_start_64, line = line)
+    
+    # Calculate delta_v = v(f_start_64 + df_64) - v(f_start_64)
+    v_after_step_64 = freq_to_vel_absolute(f_start_64 + df_64, line = line)
+    delta_v_64 = v_after_step_64 - v_start_64
+    
+    # --- Step 3: Construct the final grid using the TARGET PRECISION (float32) ---
+    # This operation is now numerically stable.
+    v_start_final = v_start_64.to(target_dtype)
+    delta_v_final = delta_v_64.to(target_dtype)
+    indices = torch.arange(num_points, dtype=target_dtype)
+    
+    abs_velocities = v_start_final + indices * delta_v_final
+
+    # --- Step 4: Step size calculation ---
+    velocity_steps = abs_velocities[1:] - abs_velocities[:-1]
+
+    return abs_velocities, velocity_steps
+
+
+def freq_to_vel_absolute(freq, line, dtype = torch.float64):
+    """
+    Converts frequency (GHz) to absolute velocity (km/s) using the radio convention.
+    """
+    # Use high precision for constants 
+    c_kms = torch.tensor(const.c.value / 1e3, dtype=dtype, device=freq.device)
+    if line == "co21":
+        co21_rest_freq_ghz = torch.tensor(230.538, dtype=dtype, device=freq.device)
+    
+        velocities = c_kms * (co21_rest_freq_ghz - freq) / co21_rest_freq_ghz
+    else:
+        print("ERROR: Line not implemented")
+    return velocities
+
+
+def velocity_map(cube, velocities, backend = "numpy"):      
+    # Calculate intensity-weighted average velocity
+    if backend == "numpy":
+        vel_map = np.sum(cube * velocities[None, None, :], axis=2) / np.sum(cube, axis=2)
+        
+    elif backend == "pytorch":
+        vel_map = torch.sum(cube * velocities[None, None, :], dim=2) / torch.sum(cube, dim=2)
+
+    else:
+        print("ERROR: Not a valid backend")
+        return
+
     return vel_map
 
-def velocity_map(cube, velocities):    
-    
-    # Calculate intensity-weighted average velocity
-    vel_map = np.sum(cube * velocities[None, None, :], axis=2) / np.sum(cube, axis=2)
-    
-    return vel_map
 
 def create_pvd(rotated_cube, slice_start, slice_end):
     """
@@ -225,6 +259,7 @@ def rotate_spectral_cube_center_offset_arcsec(
     
     return np.moveaxis(rotated_cube, 0, -1), extent
 
+    
 def rotate_spectral_cube(cube, angle):
     """
     Rotate a spectral image cube by a specific angle.
@@ -248,6 +283,7 @@ def rotate_spectral_cube(cube, angle):
     
     return rotated_cube
 
+    
 def make_elliptical_gaussian_kernel(bmaj_arcsec, bmin_arcsec, bpa_deg, pixel_scale_arcsec, size_factor=6.0, dtype = torch.float32):
     """
     Create 2D elliptical Gaussian kernel using NumPy, returns a torch tensor.
@@ -273,6 +309,7 @@ def make_elliptical_gaussian_kernel(bmaj_arcsec, bmin_arcsec, bpa_deg, pixel_sca
     kernel /= np.sum(kernel)
 
     return torch.tensor(kernel, dtype=dtype)
+
 
 def make_elliptical_gaussian_kernel_compatible(
     xpixels, ypixels, beamSize, pixel_scale_arcsec=1.0, cent=None, size_factor=None, dtype=np.float64
@@ -348,6 +385,7 @@ def make_elliptical_gaussian_kernel_compatible(
 
     return trimmed_psf
 
+    
 def convolve_cube_with_beam(cube, kernel):
     """
     Convolve spatial dimensions of a 3D cube with the given 2D kernel.
@@ -365,3 +403,27 @@ def convolve_cube_with_beam(cube, kernel):
 
     cube_conv = F.conv2d(cube, kernel, padding=(pad_h, pad_w), groups=1)
     return cube_conv.squeeze(1).permute(1, 2, 0)  # Back to [H, W, V]
+
+################################################################################
+
+# LEGACY CODE FOR GRID_BASED MODELS, to be removed later
+
+
+def freq_to_vel_systemic_torch(freq, systemic_velocity, line = "co21", device = "cuda", dtype = torch.float64):
+    """
+    Legacy code for the gridded models.
+    """
+    # Speed of light in km/s
+    c = torch.tensor(const.c.value, dtype = dtype, device = device)/1e3
+    # Rest frequency of the CO(2-1) line in Hz
+    co21_rest_freq = torch.tensor(230.538, dtype = dtype, device = device)
+    if line == "co21":
+        blueshifted_co21_freq = co21_rest_freq * (1 - systemic_velocity / c)
+        velocities = c * (1 - freq / co21_rest_freq) - systemic_velocity
+        return velocities, blueshifted_co21_freq
+
+def freq_to_vel_absolute_torch(freq, line="co21", device="cpu", dtype = torch.float64):
+    c = torch.tensor(const.c.value, dtype=dtype, device=device) / 1e3
+    co21_rest_freq = torch.tensor(230.538, dtype=dtype, device=device)
+    velocities = -c * (freq - co21_rest_freq) / co21_rest_freq
+    return velocities, co21_rest_freq
