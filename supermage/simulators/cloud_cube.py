@@ -275,9 +275,6 @@ class CloudRasterizerOversample(Module):
         # ── low‑res velocity grid ────────────────────────────
         # velocity axis -------------------------------------------------
         vel_axis, dv = create_velocity_grid_stable(f_start = freq_axis[0], f_end = freq_axis[-1], num_points = len(freq_axis), target_dtype = dtype, line = line)
-        if not torch.allclose(vel_axis[1:] - vel_axis[:-1],
-                              vel_axis[1]  - vel_axis[0]):
-            raise ValueError("vel_axis must be uniformly spaced.")
         self.vel0_lo = vel_axis[0].to(dtype)
         self.dv_lo   = float((vel_axis[1] - vel_axis[0]).item())
         self.Nv_lo   = vel_axis.numel()

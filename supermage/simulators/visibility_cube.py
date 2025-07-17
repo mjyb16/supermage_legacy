@@ -28,6 +28,7 @@ class VisibilityCube(Module):
         self.pixelscale = pixelscale
         self.flux = Param("flux", None)
         self.device = cube_simulator.device
+        self.dtype = cube_simulator.dtype
 
         #pixelscale_rad = self.pixelscale * (np.pi / 180.0) / 3600.0  # arcsec -> radians
         #self.pixel_area_sr = pixelscale_rad**2
