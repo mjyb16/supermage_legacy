@@ -64,6 +64,7 @@ def create_velocity_grid_stable(
     f_end: float,
     num_points: int,
     target_dtype = torch.float32,
+    device = "cpu",
     line = "co21"
 ):
     """
@@ -105,7 +106,7 @@ def create_velocity_grid_stable(
     # --- Step 4: Step size calculation ---
     velocity_steps = abs_velocities[1:] - abs_velocities[:-1]
 
-    return abs_velocities, velocity_steps
+    return abs_velocities.to(device = device), velocity_steps.to(device = device)
 
 
 def freq_to_vel_absolute(freq, line, dtype = torch.float64):

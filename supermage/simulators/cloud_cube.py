@@ -56,7 +56,8 @@ class CloudCatalog(Module):
                 dimension=2, scramble=True, seed=seed
             )
             # draw in [-1,1]^2 then scale to pc
-            self.pos_gal0 = (sobol.draw(int(N_clouds), dtype = dtype) * 2.0 - 1.0) * fov_half_pc
+            self.pos_gal0 = ((sobol.draw(int(N_clouds), dtype = dtype) * 2.0 - 1.0) * fov_half_pc)
+            self.pos_gal0 = self.pos_gal0.to(device = device)
 
         elif sampling_method == "uniform":
             # existing pure‑uniform sampler (unchanged) -----------------
@@ -288,6 +289,7 @@ class CloudRasterizerOversample(Module):
         # ── low‑res spatial grid ─────────────────────────────────────
         self.pixscale_lo = float(pixel_scale_arcsec)
         self.N_pix_lo    = int(N_pix_x)
+        self.N_pix = self.N_pix_lo # Makes API compatible with the other rasterizers
         self.fov_half_lo = 0.5 * (self.N_pix_lo - 1) * self.pixscale_lo
 
         # ── high‑res spatial grid ────────────────────────────────────
