@@ -2,6 +2,7 @@ import torch, math, torch.nn.functional as F
 from caskade import Module, forward, Param
 import numpy as np
 from supermage.utils.uv_utils import gaussian_pb
+from supermage.utils.cube_tools import create_velocity_grid_stable
 
 class VisibilityCubePadded(Module):
     """
@@ -15,6 +16,7 @@ class VisibilityCubePadded(Module):
         npix,                 # final grid side
         pixelscale,           # ″ / pix on the final grid
         dish_diameter: float = 12.0,
+        line = "co21"
     ):
         super().__init__()
         self.cube_simulator = cube_simulator
@@ -58,6 +60,10 @@ class VisibilityCubePadded(Module):
             ],
             dim=0,                                  # (N_chan, S, S)
         )
+        
+        vel_axis, dv = create_velocity_grid_stable(f_start = freqs[0], f_end = freqs[-1], num_points = len(freqs), target_dtype = self.dtype, line = line)
+
+        self.dv = dv[0]
 
     # ---------------------------------------------------------------------
     @forward
@@ -75,7 +81,7 @@ class VisibilityCubePadded(Module):
         # 2. scale to requested total flux *before* padding
         if flux is None:
             flux = self.flux if self.flux is not None else 1.0
-        cube_pb = cube_pb * flux / cube_pb.sum()
+        cube_pb = cube_pb * flux / self.dv / cube_pb.sum() #Integrated flux in Jy km/s
 
         # 3. pad *both* spatial axes to (npix, npix)
         cube_pad = F.pad(cube_pb, self.pad, mode="constant", value=0.0)
@@ -84,7 +90,7 @@ class VisibilityCubePadded(Module):
         # 4. FFT  (channel‑wise 2‑D)
         fft_cube = torch.fft.fftshift(
             torch.fft.fft2(torch.fft.ifftshift(cube_pad, dim=(-2, -1)),
-                           norm="forward"),
+                           norm="backward"),
             dim=(-2, -1),
         )
         del cube_pad                                           # memory
