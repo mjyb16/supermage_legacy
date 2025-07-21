@@ -112,21 +112,10 @@ def gaussian_pb(diameter=12, freq=432058061289.4426, shape=(500, 500), deltal=0.
     y = torch.linspace(-half_fov, half_fov, shape[1], device=device, dtype = dtype)
     x, y = torch.meshgrid(x, y, indexing='xy')
 
-    # Gaussian PB parameters
-    mean = torch.tensor([0.0, 0.0], device=device, dtype = dtype)  # Mean (center) of the Gaussian
+    # just the exponent part 
     std = fwhm / (2 * torch.sqrt(2 * torch.log(torch.tensor(2.0, device=device))))
-    covariance_matrix = torch.tensor([[std**2, 0], [0, std**2]], device=device, dtype = dtype)  # Covariance matrix
-
-    # 2-D Gaussian PB
-    x_y = torch.stack([x.ravel(), y.ravel()], dim=1)
-    inv_covariance_matrix = torch.inverse(covariance_matrix)
-    diff = x_y - mean
-    pb = (
-        1 / (2 * torch.pi * torch.sqrt(torch.det(covariance_matrix)))
-    ) * torch.exp(-0.5 * torch.sum(diff @ inv_covariance_matrix * diff, dim=1))
-
-    # Reshape the PDF values to match the shape of the grid
-    pb = pb.view(x.shape)
+    r2 = x**2 + y**2
+    pb  = torch.exp(-0.5 * r2 / std**2)
 
     return pb/pb.max(), fwhm
 

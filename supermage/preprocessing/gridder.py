@@ -110,6 +110,7 @@ def casa_pswf_window(u,
                      normalize: bool = True):
     """
     CASA/Schwab prolate-spheroidal gridding kernel (separable 1-D form).
+    Credit: Ryan Loomis via beams_and_weighting
 
     Parameters
     ----------
