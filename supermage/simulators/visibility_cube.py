@@ -61,7 +61,7 @@ class VisibilityCubePadded(Module):
 
     # ---------------------------------------------------------------------
     @forward
-    def forward(self, plot: bool, flux: torch.Tensor | None = None):
+    def forward(self, plot, flux = None):
         """
         If `plot` is True → full UV cube masked by `mask`.
         If `plot` is False → only values where mask == True.
