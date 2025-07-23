@@ -23,7 +23,8 @@ def cg_solve(hvp, b, x0=None, tol=1e-6, maxiter=20):
         rs_old = rs_new
     return x
 
-def lm_cg(
+
+def lm_cg_og(
     X, Y, f,
     C=None,
     epsilon=1e-1, L=1.0, L_dn=11.0, L_up=9.0,
@@ -98,6 +99,106 @@ def lm_cg(
             break
 
         # new gradient
+        _, grad = chi2_and_grad(X)
+
+    return X, L, chi2
+
+def lm_cg(
+    X, Y, f, n_points,
+    C=None,
+    epsilon=1e-1, L=1.0, L_dn=11.0, L_up=9.0,
+    max_iter=50, cg_maxiter=20, cg_tol=1e-6,
+    L_min=1e-9, L_max=1e9,
+    stopping=1e-4,
+    verbose=True,               # <-- new flag
+    Nielsen = True,
+    tau = 1e-1
+):    
+    nu, bad_iters = 2.0, 0
+    # prepare Cinv
+    if C is None:
+        Cinv = torch.ones_like(Y)
+    elif C.ndim == 1:
+        Cinv = 1.0 / C
+    else:
+        Cinv = torch.linalg.inv(C)
+
+    def chi2_and_grad(x):
+        fY  = f(x)
+        dY  = Y - fY
+        chi2= (dY**2 * Cinv).sum()
+        _, vjp_fn = vjp(f, x)
+        grad = vjp_fn(Cinv * dY)[0]
+        return chi2, grad
+
+    def hvp(v):
+        _, jvp_out = jvp(f, (X,), (v,))
+        w = Cinv * jvp_out
+        _, vjp_fn = vjp(f, X)
+        return vjp_fn(w)[0] + L * v
+
+    # approximate diag(J^T W J) cheaply
+    def approx_diag(hvp, D, k=2):
+        diags = []
+        for _ in range(k):
+            z = torch.randint(0, 2, (D,), device=X.device, dtype=X.dtype)*2 - 1  # ±1
+            Hz = hvp(z)
+            diags.append(z * Hz)
+        return torch.stack(diags).mean(0).clamp_min(1e-12)
+    # or faster: use Hutchinson (random ±1 vector) a couple of times
+    D = X.numel()
+    L = tau * approx_diag(hvp, D, k=2).max()   # tau ∈ [1e-3, 1e0] usually
+
+    chi2, grad = chi2_and_grad(X)
+    if verbose:
+        print(f"{'Iter':>4} | {'chi2':>12} | {'chi2_new':>12} | {'λ':>8} | {'ρ':>6} | {'acc':>4}")
+        print("-"*60)
+
+    for it in range(max_iter):
+
+        cg_tol_iter = 1e-2 if it < 5 else cg_tol
+        h = cg_solve(lambda v: hvp(v), grad, maxiter=cg_maxiter, tol=cg_tol_iter)
+    
+        # trust region
+        max_step = 5.0
+        nh = torch.norm(h)
+        if nh > max_step:
+            h = h * (max_step/nh)
+    
+        chi2_new, _ = chi2_and_grad(X + h)
+    
+        pred = 0.5 * (h @ (L*h - grad))
+        rho  = (chi2 - chi2_new) / pred.abs()
+    
+        good = rho > 0 and torch.isfinite(chi2_new)
+    
+        if good:
+            X    = X + h
+            chi2 = chi2_new
+            L    = L * max(1/3, 1 - (2*rho - 1)**3)
+            nu   = 2.0
+            bad_iters = 0
+        else:
+            L  = L * nu
+            nu = 2.0 * nu
+            bad_iters += 1
+    
+            if bad_iters >= 2:  # gradient fallback
+                alpha = 1e-2
+                h = -alpha * grad
+                chi2_new, _ = chi2_and_grad(X + h)
+                if chi2_new < chi2:
+                    X, chi2 = X + h, chi2_new
+                    bad_iters = 0  # reset
+                # don't change L here
+    
+        if verbose:
+            print(f"{it:4d} | {chi2.item()/n_points:12.4e} | {chi2_new.item()/n_points:12.4e} | {L:8.2e} | {rho.item():6.3f} | {good}")
+            print(X + h)
+    
+        if torch.norm(h) < stopping:
+            break
+    
         _, grad = chi2_and_grad(X)
 
     return X, L, chi2
