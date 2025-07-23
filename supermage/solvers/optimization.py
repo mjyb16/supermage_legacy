@@ -23,6 +23,112 @@ def cg_solve(hvp, b, x0=None, tol=1e-6, maxiter=20):
         rs_old = rs_new
     return x
 
+def lm_cg_annealed(
+    X, Y, f, n_points,
+    C=None,
+    epsilon=1e-1, L=1.0, L_dn=11.0, L_up=9.0,
+    max_iter=50, cg_maxiter=20, cg_tol=1e-6,
+    L_min=1e-9, L_max=1e9,
+    stopping=1e-4,
+    verbose=True,
+    # --- annealing extras ---
+    T_start=10.0, T_end=1.0, n_temps=5,            # temperature schedule
+    noise_scale=0.0,                               # step noise amplitude at T_start; scaled ∝ T
+    schedule="exp",                                # "exp" or "linear"
+):
+    """
+    Deterministic annealing Levenberg–Marquardt with CG inner solves.
+
+    Tempering: replace Cinv by Cinv/T, so χ²_T = (dY^2 * Cinv/T).sum().
+    As T ↓ 1 we recover the true objective.
+
+    noise_scale: std of Gaussian noise added to step h at T=T_start, scaled linearly to 0 at T=1.
+    """
+
+    # ---------- prep ----------
+    if C is None:
+        Cinv_full = torch.ones_like(Y)
+    elif C.ndim == 1:
+        Cinv_full = 1.0 / C
+    else:
+        Cinv_full = torch.linalg.inv(C)
+
+    # temperature ladder
+    if n_temps < 1:
+        raise ValueError("n_temps must be ≥ 1")
+    if schedule == "exp":
+        Ts = torch.logspace(torch.log10(torch.tensor(T_start)),
+                            torch.log10(torch.tensor(T_end)),
+                            steps=n_temps, device=X.device, dtype=X.dtype)
+    elif schedule == "linear":
+        Ts = torch.linspace(T_start, T_end, steps=n_temps,
+                            device=X.device, dtype=X.dtype)
+    else:
+        raise ValueError("schedule must be 'exp' or 'linear'")
+
+    def lm_stage(X_init, Cinv_scaled, T, stage_idx):
+        nonlocal L  # keep damping across stages (optional; comment to reset per stage)
+
+        def chi2_and_grad(x):
+            fY  = f(x)
+            dY  = Y - fY
+            chi2= (dY**2 * Cinv_scaled).sum()
+            _, vjp_fn = vjp(f, x)
+            grad = vjp_fn(Cinv_scaled * dY)[0]
+            return chi2, grad, dY
+
+        def hvp(v):
+            _, jvp_out = jvp(f, (X_stage,), (v,))
+            w = Cinv_scaled * jvp_out
+            _, vjp_fn = vjp(f, X_stage)
+            return vjp_fn(w)[0] + L * v
+
+        X_stage = X_init
+        chi2, grad, dY = chi2_and_grad(X_stage)
+
+        if verbose:
+            hdr = f"Stage {stage_idx+1}/{n_temps}  T={T:.3g}"
+            print(hdr)
+            print(f"{'Iter':>4} | {'chi2':>12} | {'chi2_new':>12} | {'λ':>8} | {'ρ':>6} | {'acc':>4}")
+
+        for it in range(max_iter):
+            # solve (H+λI)h = g
+            h = cg_solve(hvp, grad, maxiter=cg_maxiter, tol=cg_tol)
+
+            # add annealing noise (decays with T)
+            if noise_scale > 0.0 and T > 1.0:
+                sigma = noise_scale * (T - 1.0) / (T_start - 1.0)
+                h = h + sigma * torch.randn_like(h)
+
+            chi2_new, _, _ = chi2_and_grad(X_stage + h)
+            expected = torch.dot(h, hvp(h) + grad)
+            rho = (chi2 - chi2_new) / torch.abs(expected)
+
+            accepted = (rho >= epsilon)
+            if accepted:
+                X_stage, chi2 = X_stage + h, chi2_new
+                L = max(L / L_dn, L_min)
+            else:
+                L = min(L * L_up, L_max)
+
+            if verbose:
+                print(f"{it:4d} | {chi2.item()*T/n_points:12.4e} | {chi2_new.item()*T/n_points:12.4e} | {L:8.2e} | {rho.item():6.3f} | {str(accepted):>4}")
+
+            if torch.norm(h) < stopping:
+                break
+
+            # refresh grad at new point (or old if rejected)
+            _, grad, _ = chi2_and_grad(X_stage)
+
+        return X_stage, chi2
+
+    # ---------- run ladder ----------
+    X_curr, chi2_curr = X, None
+    for k, T in enumerate(Ts):
+        Cinv_T = Cinv_full / T
+        X_curr, chi2_curr = lm_stage(X_curr, Cinv_T, float(T), k)
+
+    return X_curr, L, chi2_curr
 
 def lm_cg_og(
     X, Y, f,
