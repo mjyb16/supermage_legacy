@@ -102,6 +102,152 @@ def lm_cg(
 
     return X, L, chi2
 
+def build_grad_H_streaming(f, X, dY, Cinv, is_diag):
+    Din = X.numel()
+    grad = torch.zeros(Din, device=X.device, dtype=X.dtype)
+    H    = torch.zeros(Din, Din, device=X.device, dtype=X.dtype)
+
+    basis = torch.eye(Din, device=X.device, dtype=X.dtype)
+
+    cols = []  # keep small: Din columns only
+    for k in range(Din):
+        Jcol = jvp(f, (X,), (basis[k],))[1]        # shape = (Dout,)
+        if is_diag:
+            wJcol = Cinv * Jcol                    # weight rows
+            grad[k] = torch.dot(wJcol, dY)
+        else:
+            wJcol = Cinv @ Jcol
+            grad[k] = Jcol @ (Cinv @ dY)
+
+        cols.append(wJcol)                          # store weighted col, size Dout
+
+    # build H using only Din vectors (no Dout×Din matrix)
+    for i in range(Din):
+        for j in range(i, Din):
+            Hij = torch.dot(cols[i], jvp(f, (X,), (basis[j],))[1] if is_diag else (Cinv @ jvp(f, (X,), (basis[j],))[1]))
+            H[i, j] = Hij
+            H[j, i] = Hij
+
+    return grad, H
+
+def lm_jvp_memeff(
+    X, Y, f,
+    C=None,
+    epsilon=1e-1, L=1.0, L_dn=11.0, L_up=9.0,
+    max_iter=50, cg_maxiter=20, cg_tol=1e-6,   # cg_* kept for signature compatibility (unused)
+    L_min=1e-9, L_max=1e9,
+    stopping=1e-4,
+    verbose=True,
+):
+    """
+    Dense (direct solve) Levenberg–Marquardt matching lm_cg signature but without CG.
+
+    Parameters are identical to lm_cg; cg_maxiter & cg_tol are ignored.
+
+    Returns
+    -------
+    X      : optimised parameter vector
+    L      : final damping value
+    chi2   : final chi^2 (scalar tensor)
+    """
+
+    # Clone to avoid in-place modification of caller's tensor
+    X = X.clone()
+
+    # ------------------------------------------------------------------
+    # Prepare inverse covariance / weights
+    # ------------------------------------------------------------------
+    if C is None:
+        # Diagonal weights = 1
+        Cinv = torch.ones_like(Y)
+        is_diag = True
+    elif C.ndim == 1:
+        Cinv = 1.0 / C
+        is_diag = True
+    else:
+        Cinv = torch.linalg.inv(C)
+        is_diag = False
+
+    def forward_residual(x):
+        fY = f(x)
+        dY = Y - fY
+        return fY, dY
+
+    def chi2_from_residual(dY):
+        if is_diag:
+            return (dY**2 * Cinv).sum()
+        else:
+            return (dY @ Cinv @ dY)
+
+    # Initial χ²
+    fY, dY = forward_residual(X)
+    chi2 = chi2_from_residual(dY)
+
+    if verbose:
+        print(f"{'Iter':>4} | {'chi2':>12} | {'chi2_new':>12} | {'λ':>8} | {'ρ':>6} | {'acc':>4}")
+        print("-"*60)
+
+    Din = X.numel()
+    eye = torch.eye(Din, device=X.device, dtype=X.dtype)
+
+    for it in range(max_iter):
+        torch.cuda.empty_cache()
+        # --------------------------------------------------------------
+        # Jacobian J : (Dout, Din)
+        # --------------------------------------------------------------
+        # jacfwd returns shape of output + shape of input -> (Dout, Din)
+        with torch.no_grad():        # safe: jvp builds forward graph only
+            grad, H = build_grad_H_streaming(f, X, dY, Cinv, is_diag)
+
+        H = 0.5*(H + H.T)
+        # Damped system: (H + L I) h = grad
+        H_damped = H + L * eye
+
+        # Solve
+        h = torch.linalg.solve(H_damped, grad)
+
+        if h.ndim > 1:  # ensure vector
+            h = h.squeeze(-1)
+
+        # --------------------------------------------------------------
+        # Candidate update
+        # --------------------------------------------------------------
+        fY_new, dY_new = forward_residual(X + h)
+        chi2_new = chi2_from_residual(dY_new)
+
+        # Expected improvement (match cg version): h^T[(H + L I)h + grad]
+        expected = h @ (H_damped @ h + grad)
+        if expected.abs() < 1e-32:
+            rho = torch.tensor(0.0, device=X.device, dtype=X.dtype)
+        else:
+            rho = (chi2 - chi2_new) / expected.abs()
+
+        accepted = (rho >= epsilon)
+        if accepted:
+            X = X + h
+            chi2 = chi2_new
+            L = max(L / L_dn, L_min)
+            # Recompute residual for next iteration (lazy update okay)
+            fY, dY = fY_new, dY_new
+        else:
+            L = min(L * L_up, L_max)
+
+        if verbose:
+            i = 2 if Din > 2 else 0
+            H_ii = H[i, i].item()
+            print(f"param[{i}]: grad={grad[i].item():.3e}, H_ii={H_ii:.3e}, L={L:.3e}")
+            print(f"{it:4d} | {chi2.item():12.4e} | {chi2_new.item():12.4e} | {L:8.2e} | {rho.item():6.3f} | {str(bool(accepted)):>4} "
+                  f"M_bh : {X[i] if Din>2 else X[0]}, {h[i] if Din>2 else h[0]},\n {h}")
+
+        # Stopping criterion
+        if torch.norm(h) < stopping:
+            break
+        if L >= L_max:
+            break
+
+    return X, L, chi2
+    
+
 
 def lm_direct(
     X, Y, f,
@@ -164,6 +310,7 @@ def lm_direct(
     eye = torch.eye(Din, device=X.device, dtype=X.dtype)
 
     for it in range(max_iter):
+        torch.cuda.empty_cache()
         # --------------------------------------------------------------
         # Jacobian J : (Dout, Din)
         # --------------------------------------------------------------
@@ -191,16 +338,8 @@ def lm_direct(
         # Damped system: (H + L I) h = grad
         H_damped = H + L * eye
 
-        # Solve (use Cholesky if PD, else fallback)
-        try:
-            # Safer to add a tiny jitter if near-singular
-            h = torch.cholesky_solve(
-                torch.cholesky(H_damped, upper=False).transpose(-1, -2) @ grad.unsqueeze(-1),
-                torch.cholesky(H_damped, upper=False)
-            )  # This is convoluted; simpler to just use solve unless you *need* cholesky
-        except:
-            # Fallback to generic solve
-            h = torch.linalg.solve(H_damped, grad)
+        # Solve
+        h = torch.linalg.solve(H_damped, grad)
 
         if h.ndim > 1:  # ensure vector
             h = h.squeeze(-1)

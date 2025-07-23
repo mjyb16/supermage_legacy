@@ -69,6 +69,132 @@ def interpolate_velocity(R_grid: torch.Tensor,
 
     return v_lo + w * (v_hi - v_lo)
 
+
+class MGEVelocityIntr(Module):
+    """
+    Identical setup to `ThinMGEVelocity`, but now we use the intrinsic q directly.
+    """
+    def __init__(self, N_components: int, device, dtype, quad_points=128, radius_res = 4096, variable_M_to_L = False, soft = 0.0, G=0.004301):
+        """
+        Soft: softening length in parsecs
+        """
+        super().__init__("MGEVelocityIntr")
+        self.device = device
+        self.dtype  = dtype
+        
+        self.N_components = N_components
+        
+        # Same parameter definitions
+        self.surf   = Param("surf",   shape=(N_components,))
+        self.sigma  = Param("sigma",  shape=(N_components,))
+        self.qintr   = Param("qintr",   shape=(N_components,))
+        if variable_M_to_L:
+            self.M_to_L = Param("M_to_L", shape=(N_components,))
+        else:
+            self.M_to_L = Param("M_to_L", shape=())
+        
+        self.m_bh  = Param("m_bh",  shape=())
+        self.quad_points = quad_points
+        self.radius_res = radius_res
+
+        self.soft = soft
+        self.G = G
+        self.inc = Param("inc",   shape=())
+
+    def radial_velocity(self, R_flat,
+                 surf, sigma, qintr, M_to_L,
+                 inc, m_bh):
+        """
+        Compute the rotational velocity at radii R_flat, but use a
+        double-exponential transform from [0,1] -> (0,∞).
+        """        
+        sqrt_2pi = np.sqrt(2.0*np.pi)
+        qobs = torch.sqrt(qintr**2 * (torch.sin(inc))**2 + (torch.cos(inc))**2)
+        mass_density = surf * M_to_L * qobs / (qintr * sigma * sqrt_2pi)
+        
+        N_points = R_flat.shape[0]
+        
+        # Scale by median sigma
+        scale = sigma.quantile(q = 0.5)
+        sigma_sc = sigma / scale
+        R_sc = R_flat / scale
+        soft_sc = self.soft / scale
+
+        mds = sigma_sc.quantile(q = 0.5)
+        mxs = torch.max(sigma_sc)
+        xlim = torch.tensor([
+            torch.arcsinh(torch.log(1e-7 * mds)*2/np.pi),
+            torch.arcsinh(torch.log(1e3  * mxs)*2/np.pi)
+        ])
+        
+        # --- Gauss–Legendre on [0,1] ---
+        t_1d, w_1d = leggauss_interval(self.quad_points, xlim[0].item(), xlim[1].item(), self.device, self.dtype)
+        
+        # --- Double-exponential transform t->u in (0,∞) ---
+        u_1d, du_1d = transform_DE(t_1d)
+        
+        R_i  = R_sc.view(-1, 1, 1)                     # (N,1,1)
+        u_j  = u_1d.view(1,  -1, 1)                    # (1,Q,1)torch.linspace(-1, 1, nx, device=device, dtype=dtype) * pixelscale * (nx - 1) / 2
+        w_j  = w_1d.view(1,  -1, 1)                    # (1,Q,1)
+        du_j = du_1d.view(1, -1, 1)                    # (1,Q,1)
+        
+        sigma_mat    = sigma_sc.view(1, 1, -1)         # (1,1,C)
+        qintr_mat   = qintr.view(1, 1, -1)           # (1,1,C)
+        mass_den_mat = mass_density.view(1, 1, -1)     # (1,1,C)
+        
+        # ---- kernel -----------------------------------------------------------------
+        one_plus = 1.0 + u_j                           # (1,Q,1)
+        exp_val  = torch.exp(-0.5 * R_i.pow(2) /
+                             (sigma_mat.pow(2) * one_plus))          # (N,Q,C)
+        
+        denom    = one_plus.pow(2) * torch.sqrt(qintr_mat.pow(2) + u_j)
+        
+        term      = (qintr_mat * mass_den_mat * exp_val) / denom    # (N,Q,C)
+        weighted  = term * du_j * w_j                                # (N,Q,C)
+        
+        # ---- quadrature & component sums -------------------------------------------
+        integral_val = weighted.sum(dim=1).sum(dim=1)   # (N,)
+        
+        # ---- finish exactly as before ----------------------------------------------
+        vc2_mge_factor = 2.0 * np.pi * self.G * (scale**2)
+        vc2_mge = vc2_mge_factor * integral_val
+        
+        vc2_bh = self.G * 10**m_bh / scale * (R_sc**2 + soft_sc**2).pow(-1.5)
+        
+        v_rot_flat = R_sc * torch.sqrt(vc2_mge + vc2_bh)   # (N,)
+        
+        return v_rot_flat
+        
+    @forward
+    def velocity(
+        self,
+        R_map,                           # 2-D tensor [H,W]  (pc)
+        surf=None, sigma=None, qintr=None, M_to_L=None, inc = None, m_bh=None
+    ):
+        """
+        Returns v_rot(R) for every pixel in the sky plane.
+        """
+
+        Rmin = torch.as_tensor(self.soft, dtype=self.dtype, device=self.device)
+        Rmax = R_map.max()
+
+        # 1-D lookup table (same as before)
+        R_grid = torch.logspace(
+            torch.log10(Rmin),
+            torch.log10(Rmax),
+            self.radius_res,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        v_grid = self.radial_velocity(
+            R_grid, surf, sigma, qintr, M_to_L, inc, m_bh
+        )
+
+        # interpolate onto the pixel-by-pixel radii
+        v_abs = interpolate_velocity(R_grid, R_map, v_grid)      # (H,W)
+
+        return v_abs
+
 class ThinMGEVelocity(Module):
     """
     Identical parameters to `MGEVelocity`, but the `forward` method now
@@ -369,14 +495,14 @@ class Nuker_MGE(Module):
         device = R_flat.device
         dtype  = R_flat.dtype
 
-        qobs = q*torch.ones(self.N_components, device = device).to(dtype = dtype)
+        qintr = q*torch.ones(self.N_components, device = device).to(dtype = dtype)
 
         NN_input = torch.cat([alpha, gamma, beta]).to(torch.float32)
         NN_output = self.NN.forward(NN_input).to(torch.float64)
         
         surf = NN_output*I_b
         MGE_sigma = self.sigma*r_b
-        v_rot = self.MGE.velocity(rot_x, rot_y, rot_z, surf = surf, sigma = MGE_sigma, qobs = qobs, G = G, soft = soft)
+        v_rot = self.MGE.velocity(rot_x, rot_y, rot_z, surf = surf, sigma = MGE_sigma, qintr = qintr, G = G, soft = soft)
         return v_rot
 
 
