@@ -1,4 +1,5 @@
 import torch
+import numpy as np
 from torch.func import jvp, vjp
 from torch.func import jacrev, jacfwd  # (PyTorch ≥2.0; for older versions import from functorch)
 
@@ -198,10 +199,12 @@ def lm_cg_og(
             H_ii = Hi_plus_L - L
             
             #print(f"param[{i}]: grad={grad[i].item():.3e}, H_ii={H_ii:.3e}, L={L:.3e}")
-            print(f"{it:4d} | {chi2.item()/n_points:12.4e} | {chi2_new.item()/n_points:12.4e} | {L:8.2e} | {rho.item():6.3f} | {str(accepted):>4} M_bh : {X[2]}")
+            print(f"{it:4d} | {chi2.item()/n_points:12.4e} | {chi2_new.item()/n_points:12.4e} | {L:8.2e} | {rho.item():6.3f} | {str(bool(accepted)):>4} ")
             #print(X)
 
         if torch.norm(h) < stopping:
+            break
+        if np.isnan(rho.item()):
             break
 
         # new gradient
@@ -453,7 +456,106 @@ def lm_jvp_memeff(
             break
 
     return X, L, chi2
-    
+
+
+def lm_direct_trust_region(
+    X, Y, f,
+    n_chi,
+    C=None,
+    L      = 1.0,              # initial damping
+    max_iter = 50,
+    L_min   = 1e-9, L_max = 1e9,
+    stopping= 1e-8,
+    verbose = True,
+):
+    """
+    Dense (direct‑solve) Levenberg–Marquardt with
+    Nocedal‑Wright style λ adaptation (no ε, L_dn, L_up needed).
+    Returns
+    -------
+    X*   : optimised parameters
+    L*   : final damping
+    chi2 : final χ²
+    """
+    # -----------------------------------------------------------
+    # House‑keeping
+    # -----------------------------------------------------------
+    X = X.clone()                           # avoid in‑place edits
+    if C is None:
+        Cinv, is_diag = torch.ones_like(Y), True
+    elif C.ndim == 1:
+        Cinv, is_diag = 1.0 / C, True
+    else:                                   # full covariance
+        Cinv, is_diag = torch.linalg.inv(C), False
+
+    def forward_residual(x):
+        fY = f(x)
+        return fY, Y - fY                   # f(x), residual
+
+    def chi2_from_residual(dY):
+        return (dY**2 * Cinv).sum() if is_diag else dY @ Cinv @ dY
+
+    fY, dY = forward_residual(X)
+    chi2   = chi2_from_residual(dY)
+
+    if verbose:
+        print(f"{'Iter':>4} | {'χ²':>12} | {'χ²_new':>12} | {'λ':>8} | {'ρ':>6} | {'acc':>4}")
+        print("-"*60)
+
+    Din  = X.numel()
+    eye  = torch.eye(Din, device=X.device, dtype=X.dtype)
+    nu   = 2.0                              # growth factor for λ updates
+
+    # -----------------------------------------------------------
+    # Main loop
+    # -----------------------------------------------------------
+    for it in range(max_iter):
+        # Jacobian J  (shape: Dout × Din)
+        J = jacfwd(f)(X).reshape(-1, Din)
+
+        # Gradient g and Gauss–Newton Hessian H
+        if is_diag:
+            w_dY = Cinv * dY
+            grad = J.T @ w_dY
+            H    = J.T @ (J * Cinv.view(-1, 1))
+        else:
+            w_dY = Cinv @ dY
+            grad = J.T @ w_dY
+            H    = J.T @ Cinv @ J
+
+        # Solve (H + λI) h = g
+        H_damped = H + L * eye
+        h        = torch.linalg.solve(H_damped, grad).squeeze(-1)
+
+        # Candidate step
+        fY_new, dY_new = forward_residual(X + h)
+        chi2_new       = chi2_from_residual(dY_new)
+
+        # ρ = (actual gain) / (predicted gain)
+        expected = h @ (H_damped @ h + grad)
+        rho      = (chi2 - chi2_new) / expected.abs() if expected.abs() > 1e-32 else X.new_zeros(())
+
+        # ---------- trust‑region λ update -----------------------
+        if rho > 0:                          # step accepted
+            X, chi2, fY, dY = X + h, chi2_new, fY_new, dY_new
+            L  = torch.clamp(L * max(1/3.0, 1 - (2*rho - 1)**3), L_min, L_max)
+            nu = 2.0                         # reset growth
+            accepted = True
+        else:                                # step rejected
+            L  = torch.clamp(L * nu, L_min, L_max)
+            nu = nu * 2.0                    # exponential growth
+            accepted = False
+        # -------------------------------------------------------
+
+        if verbose:
+            print(f"{it:4d} | {chi2.item()/n_chi:12.4e} | {chi2_new.item()/n_chi:12.4e} "
+                  f"| {L:8.2e} | {rho.item():6.3f} | {accepted}")
+
+        # stopping criteria
+        if h.norm() < stopping or L >= L_max:
+            break
+
+    return X, L, chi2
 
 
 def lm_direct(
