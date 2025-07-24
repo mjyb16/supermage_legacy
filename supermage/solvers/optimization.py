@@ -131,13 +131,13 @@ def lm_cg_annealed(
     return X_curr, L, chi2_curr
 
 def lm_cg_og(
-    X, Y, f,
+    X, Y, f, n_points,
     C=None,
     epsilon=1e-1, L=1.0, L_dn=11.0, L_up=9.0,
     max_iter=50, cg_maxiter=20, cg_tol=1e-6,
     L_min=1e-9, L_max=1e9,
     stopping=1e-4,
-    verbose=True,               # <-- new flag
+    verbose=True,               # <-- new flag 
 ):
     # prepare Cinv
     if C is None:
@@ -198,8 +198,8 @@ def lm_cg_og(
             H_ii = Hi_plus_L - L
             
             #print(f"param[{i}]: grad={grad[i].item():.3e}, H_ii={H_ii:.3e}, L={L:.3e}")
-            print(f"{it:4d} | {chi2.item():12.4e} | {chi2_new.item():12.4e} | {L:8.2e} | {rho.item():6.3f} | {str(accepted):>4} M_bh : {X[2]}")
-            print(X)
+            print(f"{it:4d} | {chi2.item()/n_points:12.4e} | {chi2_new.item()/n_points:12.4e} | {L:8.2e} | {rho.item():6.3f} | {str(accepted):>4} M_bh : {X[2]}")
+            #print(X)
 
         if torch.norm(h) < stopping:
             break
@@ -458,11 +458,12 @@ def lm_jvp_memeff(
 
 def lm_direct(
     X, Y, f,
+    n_chi,
     C=None,
     epsilon=1e-1, L=1.0, L_dn=11.0, L_up=9.0,
     max_iter=50, cg_maxiter=20, cg_tol=1e-6,   # cg_* kept for signature compatibility (unused)
     L_min=1e-9, L_max=1e9,
-    stopping=1e-4,
+    stopping=1e-8,
     verbose=True,
 ):
     """
@@ -577,9 +578,8 @@ def lm_direct(
         if verbose:
             i = 2 if Din > 2 else 0
             H_ii = H[i, i].item()
-            print(f"param[{i}]: grad={grad[i].item():.3e}, H_ii={H_ii:.3e}, L={L:.3e}")
-            print(f"{it:4d} | {chi2.item():12.4e} | {chi2_new.item():12.4e} | {L:8.2e} | {rho.item():6.3f} | {str(bool(accepted)):>4} "
-                  f"M_bh : {X[i] if Din>2 else X[0]}, {h[i] if Din>2 else h[0]},\n {h}")
+            #print(f"param[{i}]: grad={grad[i].item():.3e}, H_ii={H_ii:.3e}, L={L:.3e}")
+            print(f"{it:4d} | {chi2.item()/n_chi:12.4e} | {chi2_new.item()/n_chi:12.4e} | {L:8.2e} | {rho.item():6.3f} | {str(bool(accepted)):>4} ")
 
         # Stopping criterion
         if torch.norm(h) < stopping:
@@ -588,3 +588,61 @@ def lm_direct(
             break
 
     return X, L, chi2
+
+
+def adam_optimizer(
+    X_init, Y, f,
+    C=None,
+    max_iter=300,
+    lr=1e-2,
+    T_start=None,
+    T_end=None,
+    n_points=None,          # ignored for now, kept for compatibility
+    verbose=True,
+):
+    X = X_init.clone().detach().requires_grad_(True)
+
+    # Prepare inverse covariance (assume diagonal or full)
+    if C is None:
+        Cinv = torch.ones_like(Y)
+    elif C.ndim == 1:
+        Cinv = 1.0 / C
+    else:
+        Cinv = torch.linalg.inv(C)
+
+    # Gaussian χ² function
+    def chi2_fn(X):
+        fY = f(X)
+        dY = Y - fY
+        return (dY**2 * Cinv).sum()
+
+    # Adam optimizer setup
+    optimizer = torch.optim.Adam([X], lr=lr)
+
+    # Cosine annealing temperature schedule (for optional noise injection)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_iter, eta_min=lr * 0.1)
+
+    for it in range(max_iter):
+        optimizer.zero_grad()
+        chi2 = chi2_fn(X)
+        chi2.backward()
+
+        if torch.isnan(X.grad).any() or torch.isnan(chi2):
+            print("NaNs encountered, stopping early.")
+            break
+
+        optimizer.step()
+        scheduler.step()
+
+        # Optional: temperature annealing for simulated annealing behavior
+        if T_start is not None and T_end is not None:
+            T = T_end + 0.5 * (T_start - T_end) * (1 + torch.cos(torch.tensor(it / max_iter * 3.14159)))
+            noise = torch.randn_like(X) * T.sqrt() * 1e-4
+            with torch.no_grad():
+                X.add_(noise)
+
+        if verbose and it%10==0:
+            print(f"{it:4d} | chi² = {chi2.item()/n_points:.4e} | M_bh : {X[2].item():.4f}")
+            print(X.detach())
+
+    return X.detach(), None, chi2_fn(X.detach())
