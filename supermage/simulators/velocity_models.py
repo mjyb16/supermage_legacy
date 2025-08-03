@@ -6,23 +6,28 @@ import numpy as np
 from numpy.polynomial.legendre import leggauss
 from pykeops.torch import LazyTensor
 from torch.nn.functional import conv2d, avg_pool2d
+from functools import lru_cache
+import math
 
 
-def leggauss_interval(n, t_low, t_high, device, dtype):
-    """
-    Return Gauss–Legendre nodes & weights mapped from [-1,1] -> [t_low, t_high].
-    """
-    x, w = leggauss(n)   # x in [-1,1], w for [-1,1]
-    
-    half_width = 0.5*(t_high - t_low)
-    mid        = 0.5*(t_high + t_low)
-    
-    x_mapped = half_width*(x) + mid       # in [t_low, t_high]
-    w_mapped = half_width*(w)            # scaled by the interval length
-    
-    x_mapped_t = torch.tensor(x_mapped, dtype=dtype, device=device)
-    w_mapped_t = torch.tensor(w_mapped, dtype=dtype, device=device)
-    return x_mapped_t, w_mapped_t
+@lru_cache(maxsize=None)
+def _leggauss_const(n, dtype, device):
+    x_np, w_np = np.polynomial.legendre.leggauss(n)
+    return (torch.as_tensor(x_np, dtype=dtype, device = device),
+            torch.as_tensor(w_np, dtype=dtype, device = device))
+
+# 2.  Pure-Torch mapping keeps autograd alive and avoids graph breaks.
+def leggauss_interval(n, t_low, t_high, device=None, dtype=None):
+    x0, w0 = _leggauss_const(n, dtype, device)
+
+    half = 0.5 * (t_high - t_low)        # tensor ops → differentiable
+    mid  = 0.5 * (t_high + t_low)
+
+    # allow t_low / t_high to be batched – add a dim for broadcasting
+    print()
+    x = half.unsqueeze(-1) * x0 + mid.unsqueeze(-1)
+    w = half.unsqueeze(-1) * w0
+    return x, w
 
 
 def transform_DE(t):
@@ -122,13 +127,12 @@ class MGEVelocityIntr(Module):
 
         mds = sigma_sc.quantile(q = 0.5)
         mxs = torch.max(sigma_sc)
-        xlim = torch.tensor([
-            torch.arcsinh(torch.log(1e-7 * mds)*2/np.pi),
-            torch.arcsinh(torch.log(1e3  * mxs)*2/np.pi)
-        ])
+        xlim = (torch.arcsinh(torch.log(1e-7 * mds)*2/np.pi),
+            torch.arcsinh(torch.log(1e3  * mxs)*2/np.pi))
         
         # --- Gauss–Legendre on [0,1] ---
-        t_1d, w_1d = leggauss_interval(self.quad_points, xlim[0].item(), xlim[1].item(), self.device, self.dtype)
+        lo, hi = xlim
+        t_1d, w_1d = leggauss_interval(self.quad_points, lo, hi, device = self.device, dtype = self.dtype)
         
         # --- Double-exponential transform t->u in (0,∞) ---
         u_1d, du_1d = transform_DE(t_1d)
@@ -256,13 +260,13 @@ class ThinMGEVelocity(Module):
 
         mds = sigma_sc.quantile(q = 0.5)
         mxs = torch.max(sigma_sc)
-        xlim = torch.tensor([
-            torch.arcsinh(torch.log(1e-7 * mds)*2/np.pi),
-            torch.arcsinh(torch.log(1e3  * mxs)*2/np.pi)
-        ])
+        xlim = (torch.arcsinh(torch.log(1e-7 * mds)*2/np.pi),
+            torch.arcsinh(torch.log(1e3  * mxs)*2/np.pi))
         
         # --- Gauss–Legendre on [0,1] ---
-        t_1d, w_1d = leggauss_interval(self.quad_points, xlim[0].item(), xlim[1].item(), self.device, self.dtype)
+        lo, hi = xlim
+        t_1d, w_1d = leggauss_interval(self.quad_points, lo, hi, device = self.device, dtype = self.dtype)
+
         
         # --- Double-exponential transform t->u in (0,∞) ---
         u_1d, du_1d = transform_DE(t_1d)
