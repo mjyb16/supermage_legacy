@@ -24,7 +24,6 @@ def leggauss_interval(n, t_low, t_high, device=None, dtype=None):
     mid  = 0.5 * (t_high + t_low)
 
     # allow t_low / t_high to be batched – add a dim for broadcasting
-    print()
     x = half.unsqueeze(-1) * x0 + mid.unsqueeze(-1)
     w = half.unsqueeze(-1) * w0
     return x, w
