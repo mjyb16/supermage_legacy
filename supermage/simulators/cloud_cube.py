@@ -296,6 +296,11 @@ class CloudRasterizerOversample(Module):
         self.pixscale_hi = self.pixscale_lo / self.oversamp_xy
         self.N_pix_hi    = self.N_pix_lo * self.oversamp_xy
         self.fov_half_hi = 0.5 * (self.N_pix_hi - 1) * self.pixscale_hi
+        self.cube_flat = torch.zeros(
+            self.Nv_hi * self.N_pix_hi * self.N_pix_hi,
+            device=device,
+            dtype=dtype
+        )
 
     # ------------------------------------------------------------------
     @staticmethod
@@ -305,46 +310,49 @@ class CloudRasterizerOversample(Module):
 
     # ------------------------------------------------------------------
     def _rasterise_hi(self, ra, dec, vel, flux):
-        """
-        Splat onto the high‑resolution grid (Nv_hi, Nx_hi, Ny_hi)
-        using tri‑linear interpolation.
-        """
-        ix0, fx = self._index_and_frac((ra  + self.fov_half_hi) / self.pixscale_hi)
-        iy0, fy = self._index_and_frac((dec + self.fov_half_hi) / self.pixscale_hi)
-        iv0, fv = self._index_and_frac((vel - self.vel0_hi)     / self.dv_hi)
-
-        mask = (
-            (ix0 >= 0) & (ix0 < self.N_pix_hi - 1) &
-            (iy0 >= 0) & (iy0 < self.N_pix_hi - 1) &
-            (iv0 >= 0) & (iv0 < self.Nv_hi   - 1)
+        # --- 1. continuous indices and fractional parts -------------------------
+        ix0_f, fx = self._index_and_frac((ra  + self.fov_half_hi) / self.pixscale_hi)
+        iy0_f, fy = self._index_and_frac((dec + self.fov_half_hi) / self.pixscale_hi)
+        iv0_f, fv = self._index_and_frac((vel - self.vel0_hi)     / self.dv_hi)
+    
+        # neighbour indices before clamping
+        ix1_f, iy1_f, iv1_f = ix0_f + 1, iy0_f + 1, iv0_f + 1
+    
+        # --- 2. “is this point inside the cube?” --------------------------------
+        valid = (
+            (ix0_f >= 0) & (ix0_f < self.N_pix_hi - 1) &
+            (iy0_f >= 0) & (iy0_f < self.N_pix_hi - 1) &
+            (iv0_f >= 0) & (iv0_f < self.Nv_hi   - 1)
         )
-        if mask.sum() == 0:
-            return torch.zeros(self.Nv_hi, self.N_pix_hi, self.N_pix_hi,
-                               device=self.device, dtype=flux.dtype)
-
-        ix0, iy0, iv0 = ix0[mask], iy0[mask], iv0[mask]
-        fx,  fy,  fv  = fx [mask], fy [mask], fv [mask]
-        flux          = flux[mask]
-
-        ix1, iy1, iv1 = ix0 + 1, iy0 + 1, iv0 + 1
-        wx0, wy0, wv0 = 1 - fx, 1 - fy, 1 - fv
-        wx1, wy1, wv1 =     fx,     fy,     fv
-
+    
+        # --- 3. clamp indices so they’re always legal (static shape!) -----------
+        ix0 = ix0_f.clamp(0, self.N_pix_hi - 1).long()
+        iy0 = iy0_f.clamp(0, self.N_pix_hi - 1).long()
+        iv0 = iv0_f.clamp(0, self.Nv_hi   - 1).long()
+        ix1 = ix1_f.clamp(0, self.N_pix_hi - 1).long()
+        iy1 = iy1_f.clamp(0, self.N_pix_hi - 1).long()
+        iv1 = iv1_f.clamp(0, self.Nv_hi   - 1).long()
+    
+        # --- 4. weights; 0 out the invalid ones ---------------------------------
+        w_valid = valid.to(flux.dtype)              # (M,)
+        wx0, wy0, wv0 = (1 - fx) * w_valid, (1 - fy) * w_valid, (1 - fv) * w_valid
+        wx1, wy1, wv1 =      fx  * w_valid,      fy  * w_valid,      fv  * w_valid
+    
+        # stack neighbours exactly as before (shape = (M, 8))
         ix = torch.stack([ix0, ix0, ix0, ix0, ix1, ix1, ix1, ix1], dim=1)
         iy = torch.stack([iy0, iy0, iy1, iy1, iy0, iy0, iy1, iy1], dim=1)
         iv = torch.stack([iv0, iv1, iv0, iv1, iv0, iv1, iv0, iv1], dim=1)
         wx = torch.stack([wx0, wx0, wx0, wx0, wx1, wx1, wx1, wx1], dim=1)
         wy = torch.stack([wy0, wy1, wy0, wy1, wy0, wy1, wy0, wy1], dim=1)
         wv = torch.stack([wv0, wv1, wv0, wv1, wv0, wv1, wv0, wv1], dim=1)
-
-        f_w = flux.unsqueeze(1) * (wx * wy * wv)
-
+    
+        f_w = flux.unsqueeze(1) * (wx * wy * wv)          # still (M, 8)
+    
+        # --- 5. scatter‑add – now indices are always valid ----------------------
         idx_flat = (iv * self.N_pix_hi + iy) * self.N_pix_hi + ix
-        cube_flat = torch.zeros(self.Nv_hi * self.N_pix_hi * self.N_pix_hi,
-                                device=self.device, dtype=flux.dtype)
-        cube_flat.scatter_add_(0, idx_flat.reshape(-1), f_w.reshape(-1))
-
-        return cube_flat.view(self.Nv_hi, self.N_pix_hi, self.N_pix_hi)
+        cube_scattered = torch.scatter_add(self.cube_flat, 0, idx_flat.reshape(-1), f_w.reshape(-1))
+    
+        return cube_scattered.view(self.Nv_hi, self.N_pix_hi, self.N_pix_hi)
 
     # ------------------------------------------------------------------
     @forward
