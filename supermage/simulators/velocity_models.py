@@ -488,6 +488,9 @@ class Nuker_MGE(Module):
         self.gamma = Param("gamma", shape=(1, ))
         self.r_b = Param("break_r", shape = ())
         self.I_b = Param("intensity_r_b", shape = ())
+    
+    def symexp(self, y, linthresh=1e-12, base=10.0):
+        return torch.sign(y) * linthresh * (base**torch.abs(y) - 1.0)
 
     @forward
     def velocity(self, rot_x, rot_y, rot_z,
@@ -501,7 +504,8 @@ class Nuker_MGE(Module):
         qintr = q*torch.ones(self.N_components, device = device).to(dtype = dtype)
 
         NN_input = torch.cat([alpha, gamma, beta]).to(torch.float32)
-        NN_output = self.NN.forward(NN_input).to(torch.float64)
+        NN_output_transformed = self.NN.forward(NN_input).to(torch.float64)
+        NN_output = self.symexp(NN_output_transformed)
         
         surf = NN_output*I_b
         MGE_sigma = self.sigma*r_b
