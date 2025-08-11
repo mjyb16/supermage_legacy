@@ -459,10 +459,11 @@ class MGEVelocity(Module):
        
 
 class Nuker_MGE(Module):
-    def __init__(self, N_MGE_components: int, Nuker_NN, r_min, r_max, device, dtype, quad_points=128):
+    def __init__(self, N_MGE_components: int, Nuker_NN, r_min, r_max, soft, device, dtype, quad_points=128):
         super().__init__("NukerMGE")
         self.N_components = N_MGE_components
-        self.MGE = MGEVelocity(self.N_components, quad_points = quad_points, dtype = dtype, device = device)
+        self.soft = soft
+        self.MGE = MGEVelocityIntr(self.N_components, quad_points = quad_points, dtype = dtype, device = device)
         self.MGE.surf = torch.ones((self.N_components), device = device).to(dtype = dtype)
         self.MGE.sigma = torch.ones((self.N_components), device = device).to(dtype = dtype)
         self.MGE.qobs = torch.ones((self.N_components), device = device).to(dtype = dtype)
@@ -481,10 +482,8 @@ class Nuker_MGE(Module):
         self.MGE.inc = self.inc
         self.MGE.m_bh = self.m_bh
 
-        self.q   = Param("qobs",   shape=())
-
         self.alpha = Param("alpha", shape=(1, ))
-        self.beta = Param("beta", shape=(1, ))
+        self.gmb = Param("gamma_minus_beta", shape=(1, ))
         self.gamma = Param("gamma", shape=(1, ))
         self.r_b = Param("break_r", shape = ())
         self.I_b = Param("intensity_r_b", shape = ())
@@ -493,15 +492,13 @@ class Nuker_MGE(Module):
         return torch.sign(y) * linthresh * (base**torch.abs(y) - 1.0)
 
     @forward
-    def velocity(self, rot_x, rot_y, rot_z,
-                 inc=None, m_bh=None, q = None,
-                 alpha = None, beta = None, gamma = None, r_b = None, I_b = None,
-                 G=0.004301,
-                 soft=0.0):
+    def velocity(self, R_flat,
+                 inc=None, m_bh=None,
+                 alpha = None, gmb = None, gamma = None, r_b = None, I_b = None,
+                 G=0.004301):
         device = R_flat.device
         dtype  = R_flat.dtype
-
-        qintr = q*torch.ones(self.N_components, device = device).to(dtype = dtype)
+        beta = gamma - gmb
 
         NN_input = torch.cat([alpha, gamma, beta]).to(torch.float32)
         NN_output_transformed = self.NN.forward(NN_input).to(torch.float64)
@@ -509,7 +506,7 @@ class Nuker_MGE(Module):
         
         surf = NN_output*I_b
         MGE_sigma = self.sigma*r_b
-        v_rot = self.MGE.velocity(rot_x, rot_y, rot_z, surf = surf, sigma = MGE_sigma, qintr = qintr, G = G, soft = soft)
+        v_rot = self.MGE.velocity(R_flat, surf = surf, sigma = MGE_sigma, G = G, soft = self.soft)
         return v_rot
 
 

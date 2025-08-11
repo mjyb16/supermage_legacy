@@ -18,56 +18,81 @@ def log_prior_tophat(theta, low, high):
     in_box = (theta >= low).all() & (theta <= high).all()
     return torch.tensor(0., device = device, dtype = dtype) if in_box else torch.tensor(-torch.inf, device = device, dtype = dtype)
 
+def _logp_and_grad_batch(x, log_prob_fn):
+    # one forward builds graph; one backward gives all grads
+    x = x.detach().clone().requires_grad_(True)
+    logps = torch.stack([log_prob_fn(xi) for xi in x])      # (C,)
+    logps.sum().backward()
+    grads = x.grad.detach()                                  # (C,D)
+    return logps.detach(), grads
+
 def mala(
-    log_prob_fn,                                # returns scalar torch.Tensor
-    init,                                       # (n_chains, D) numpy OR torch
+    log_prob_fn,
+    init,                        # (C,D) torch
     n_steps=2_000,
     step_size=3e-1,
-    mass_matrix=None,                           # None → identity
+    mass_matrix=None,            # Σ
+    hastings=True,
     progress=True,
 ):
-    x       = init
-    dtype = x.dtype
-    device = x.device
-    n_chains, D = x.shape
-    I       = torch.eye(D, device=device, dtype=dtype)
-    M_inv   = I if mass_matrix is None else torch.as_tensor(
-                  np.linalg.inv(mass_matrix), dtype=dtype, device=device)
-    chol    = torch.linalg.cholesky(M_inv)      # lower‑triangular
+    x = init.detach().clone()
+    dtype, device = x.dtype, x.device
+    C, D = x.shape
 
-    samples = torch.zeros((n_steps, n_chains, D),
-                          dtype=dtype, device=device)
-    acc_mask= torch.zeros((n_steps, n_chains), dtype=torch.bool, device=device)
+    Σ = torch.eye(D, dtype=dtype, device=device) if mass_matrix is None \
+        else torch.as_tensor(mass_matrix, dtype=dtype, device=device)
+    L = torch.linalg.cholesky(Σ)
 
-    pbar = range(n_steps)
+    samples  = torch.empty((n_steps, C, D), dtype=dtype, device=device)
+    acc_mask = torch.empty((n_steps, C),    dtype=torch.bool, device=device)
+
+    # cache current logp and grad once
+    logp_cur, grad_cur = _logp_and_grad_batch(x, log_prob_fn)
+
+    rng = torch.Generator(device=device)
+    rng.manual_seed(16)
+
+    it = range(n_steps)
     if progress:
         from tqdm.auto import tqdm
-        pbar = tqdm(pbar, desc="MALA")
+        it = tqdm(it, desc="MALA")
 
-    log_p = torch.stack([log_prob_fn(xi) for xi in x])     # (n_chains,)
+    for t in it:
+        eps = step_size
+        mu_x   = x + 0.5 * (eps**2) * (grad_cur @ Σ)              # (C,D)
+        noise  = torch.randn(C, D, generator=rng, device=device, dtype=dtype) @ L.T
+        x_prop = mu_x + eps * noise
 
-    for t in pbar:
-        # ---- forward & grad --------------------------------------------
-        x.requires_grad_(True)
-        grads = torch.stack([torch.autograd.grad(log_prob_fn(xi), xi)[0] for xi in x])
-    
-        noise = (chol @ torch.randn(n_chains, D, device=device, dtype=dtype).mT).mT
-        prop  = x + 0.5 * step_size**2 * (grads @ M_inv) + step_size * noise
-    
-        log_p_prop = torch.stack([log_prob_fn(xi) for xi in prop])
-        log_alpha  = log_p_prop - log_p
-        accept     = torch.log(torch.rand_like(log_alpha)) < log_alpha
-    
-        # ---- state update (must be out of autograd) ---------------------
-        with torch.no_grad():
-            x[accept]     = prop[accept]
-            log_p[accept] = log_p_prop[accept]
-        x = x.detach()            # prepare a fresh leaf for the next step
-    
+        # single forward+backward at proposal
+        logp_prop, grad_prop = _logp_and_grad_batch(x_prop, log_prob_fn)
+
+        if hastings:
+            mu_xp = x_prop + 0.5 * (eps**2) * (grad_prop @ Σ)
+            d1 = x      - mu_xp
+            d2 = x_prop - mu_x
+
+            # δ^T Σ^{-1} δ via triangular solve
+            y1 = torch.linalg.solve_triangular(L, d1.mT, upper=False).mT
+            y2 = torch.linalg.solve_triangular(L, d2.mT, upper=False).mT
+            q1 = (y1*y1).sum(-1)
+            q2 = (y2*y2).sum(-1)
+
+            corr = -0.5 * (q1 - q2) / (eps**2)
+            log_alpha = (logp_prop - logp_cur) + corr
+        else:
+            log_alpha = (logp_prop - logp_cur)
+
+        accept = torch.log(torch.rand(C, device=device, dtype=dtype)) < log_alpha
+
+        # update x, logp, *and cached grad* only where accepted
+        x[accept]        = x_prop[accept]
+        logp_cur[accept] = logp_prop[accept]
+        grad_cur[accept] = grad_prop[accept]
+
         samples[t]  = x
         acc_mask[t] = accept
 
         if progress:
-            pbar.set_postfix(acc_rate=float(acc_mask[:t+1].float().mean()))
+            it.set_postfix(acc_rate=float(acc_mask[:t+1].float().mean()))
 
     return samples.cpu().numpy(), acc_mask.cpu().numpy()
