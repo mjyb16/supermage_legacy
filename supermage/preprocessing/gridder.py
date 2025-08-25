@@ -291,7 +291,7 @@ def bin_data(u, v, values, weights, bins,
             mean_val = np.sum(val * local_w) / np.sum(local_w)
             var = np.sum(local_w * (val - mean_val)**2) / np.sum(local_w)
             # Unbiased-ish scaling with effective n
-            grid[j, i] = np.sqrt(var) * (n_eff / (max(n_eff - 1, 1))) * (1 / np.sqrt(n_eff))
+            grid[j, i] = np.sqrt(var) * np.sqrt(n_eff / (max(n_eff - 1, 1))) * (1 / np.sqrt(n_eff))
 
         elif statistics_fn == "count":
             grid[j, i] = (w > 0).sum()

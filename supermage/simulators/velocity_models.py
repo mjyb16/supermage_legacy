@@ -177,7 +177,6 @@ class MGEVelocityIntr(Module):
         """
         Returns v_rot(R) for every pixel in the sky plane.
         """
-
         Rmin = torch.as_tensor(self.soft, dtype=self.dtype, device=self.device)
         Rmax = R_map.max()
 
@@ -197,6 +196,66 @@ class MGEVelocityIntr(Module):
         v_abs = interpolate_velocity(R_grid, R_map, v_grid)      # (H,W)
 
         return v_abs
+
+class Nuker_MGE(Module):
+    def __init__(self, N_MGE_components: int, Nuker_NN, NN_dtype, distance, r_min, r_max, soft, device, dtype, quad_points=128):
+        super().__init__("NukerMGE")
+        self.N_components = N_MGE_components
+        self.soft = soft
+        self.MGE = MGEVelocityIntr(self.N_components, soft = soft, quad_points = quad_points, dtype = dtype, device = device)
+        self.MGE.surf = torch.ones((self.N_components), device = device).to(dtype = dtype)
+        self.MGE.sigma = torch.ones((self.N_components), device = device).to(dtype = dtype)
+        self.MGE.qintr = torch.ones((self.N_components), device = device).to(dtype = dtype)
+        self.MGE.M_to_L = torch.tensor([1.0], dtype = dtype, device = device)
+        self.NN = Nuker_NN
+
+        inner_slope=torch.tensor([3], device = device, dtype = dtype)
+        outer_slope=torch.tensor([3], device = device, dtype = dtype)
+        low_Gauss=torch.log10(r_min/torch.sqrt(inner_slope))
+        high_Gauss=torch.log10(r_max/torch.sqrt(outer_slope))
+        dx=(high_Gauss-low_Gauss)/self.N_components
+        self.sigma = (distance * (np.pi/0.648))*10**(low_Gauss+(0.5+torch.arange(self.N_components, device = device))*dx).to(dtype = dtype)
+        
+        self.inc   = Param("inc",   shape=())
+        self.qintr = Param("qintr", shape=())
+        self.qintr_shaper = torch.ones((self.N_components), device = device).to(dtype = dtype)
+        self.m_bh  = Param("m_bh",  shape=())
+        self.MGE.inc = self.inc
+        self.MGE.m_bh = self.m_bh
+
+        self.alpha = Param("alpha", shape=(1, ))
+        self.gmb = Param("gamma_minus_beta", shape=(1, ))
+        self.gamma = Param("gamma", shape=(1, ))
+        self.r_b = Param("break_r", shape = ())
+        self.I_b = Param("intensity_r_b", shape = ())
+        self.dtype = dtype
+        self.NN_dtype = NN_dtype
+    
+    def symexp(self, y, linthresh=1e-12, base=10.0):
+        return torch.sign(y) * linthresh * (base**torch.abs(y) - 1.0)
+
+    @forward
+    def velocity(self, R_flat,
+                 inc=None, qintr=None, m_bh=None,
+                 alpha = None, gmb = None, gamma = None, r_b = None, I_b = None,
+                 G=0.004301):
+        device = R_flat.device
+        dtype  = R_flat.dtype
+        beta = gamma - gmb
+
+        NN_input = torch.cat([alpha, beta, gamma]).to(self.NN_dtype)
+        NN_output_transformed = self.NN.forward(NN_input).to(self.dtype)
+        NN_output = self.symexp(NN_output_transformed)
+        
+        surf = NN_output*10**I_b
+        MGE_sigma = self.sigma*r_b
+        v_rot = self.MGE.velocity(R_map = R_flat, surf = surf, sigma = MGE_sigma, qintr = qintr*self.qintr_shaper)
+        return v_rot
+
+
+######################################################################################################
+# Older MGE implementations (3D Rs, qobs, etc)
+######################################################################################################
 
 class ThinMGEVelocity(Module):
     """
@@ -458,56 +517,7 @@ class MGEVelocity(Module):
         
        
 
-class Nuker_MGE(Module):
-    def __init__(self, N_MGE_components: int, Nuker_NN, r_min, r_max, soft, device, dtype, quad_points=128):
-        super().__init__("NukerMGE")
-        self.N_components = N_MGE_components
-        self.soft = soft
-        self.MGE = MGEVelocityIntr(self.N_components, quad_points = quad_points, dtype = dtype, device = device)
-        self.MGE.surf = torch.ones((self.N_components), device = device).to(dtype = dtype)
-        self.MGE.sigma = torch.ones((self.N_components), device = device).to(dtype = dtype)
-        self.MGE.qobs = torch.ones((self.N_components), device = device).to(dtype = dtype)
-        self.MGE.M_to_L = 1
-        self.NN = Nuker_NN
 
-        inner_slope=torch.tensor([3], device = device, dtype = dtype)
-        outer_slope=torch.tensor([3], device = device, dtype = dtype)
-        low_Gauss=torch.log10(r_min/torch.sqrt(inner_slope))
-        high_Gauss=torch.log10(r_max/torch.sqrt(outer_slope))
-        dx=(high_Gauss-low_Gauss)/self.N_components
-        self.sigma = 10**(low_Gauss+(0.5+torch.arange(self.N_components, device = device))*dx).to(dtype = dtype)
-        
-        self.inc   = Param("inc",   shape=())
-        self.m_bh  = Param("m_bh",  shape=())
-        self.MGE.inc = self.inc
-        self.MGE.m_bh = self.m_bh
-
-        self.alpha = Param("alpha", shape=(1, ))
-        self.gmb = Param("gamma_minus_beta", shape=(1, ))
-        self.gamma = Param("gamma", shape=(1, ))
-        self.r_b = Param("break_r", shape = ())
-        self.I_b = Param("intensity_r_b", shape = ())
-    
-    def symexp(self, y, linthresh=1e-12, base=10.0):
-        return torch.sign(y) * linthresh * (base**torch.abs(y) - 1.0)
-
-    @forward
-    def velocity(self, R_flat,
-                 inc=None, m_bh=None,
-                 alpha = None, gmb = None, gamma = None, r_b = None, I_b = None,
-                 G=0.004301):
-        device = R_flat.device
-        dtype  = R_flat.dtype
-        beta = gamma - gmb
-
-        NN_input = torch.cat([alpha, gamma, beta]).to(torch.float32)
-        NN_output_transformed = self.NN.forward(NN_input).to(torch.float64)
-        NN_output = self.symexp(NN_output_transformed)
-        
-        surf = NN_output*I_b
-        MGE_sigma = self.sigma*r_b
-        v_rot = self.MGE.velocity(R_flat, surf = surf, sigma = MGE_sigma, G = G, soft = self.soft)
-        return v_rot
 
 
 
