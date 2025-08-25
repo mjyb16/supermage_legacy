@@ -67,7 +67,7 @@ class VisibilityCubePadded(Module):
 
     # ---------------------------------------------------------------------
     @forward
-    def forward(self, plot, flux = None):
+    def forward(self, plot = True, flux = None):
         """
         If `plot` is True → full UV cube masked by `mask`.
         If `plot` is False → only values where mask == True.
@@ -148,7 +148,7 @@ class VisibilityCube(Module):
         self.primary_beams = torch.stack(pbs, dim=0)  # shape (N_freq, Nx, Ny)
 
     @forward
-    def forward(self, plot, flux = None):
+    def forward(self, plot = True, flux = None):
         cube = self.cube_simulator.forward()
 
         def pb_cube(x_slice, pb_slice):
