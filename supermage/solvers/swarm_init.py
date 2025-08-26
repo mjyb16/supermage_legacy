@@ -223,3 +223,122 @@ def sobol_ga_swarm_opt(
                   f"best={best_val.item():.4g}")
 
     return best_X, best_val, best_L, history
+
+def sobol_ga_swarm_no_nan(
+        lm_fn,                   # your lm_cg_og or lm_direct
+        param_bounds,
+        n_particles,
+        n_chi,
+        *,
+        oversample   = 10,       # generate oversample × n_particles scouts
+        keep_frac    = 0.10,     # keep this fraction (≈ n_particles)
+        eval_bs      = 128,      # batch‑size for χ² scouting
+        dtype        = torch.float64,
+        device       = "cpu",
+        lm_kwargs    = None,
+        verbose      = True,
+        seed         = 42,
+):
+    """
+    Two‑stage optimisation:
+      1. Draw oversample×n_particles Sobol points, keep the best keep_frac.
+      2. Run `lm_fn` once on each survivor (serially, so memory stays low).
+
+    Returns
+    -------
+    best_X, best_chi2, best_L, history   (same as sobol_swarm_opt)
+    """
+    if lm_kwargs is None:
+        lm_kwargs = {}
+
+    # unpack items needed to compute χ² quickly
+    Y = lm_kwargs["Y"]
+    f = lm_kwargs["f"]
+    C = lm_kwargs.get("C", None)
+
+    # --- build Cinv ONCE (matches what lm_fn will do) -----------------
+    if C is None:
+        Cinv = torch.ones_like(Y, dtype=dtype, device=device)
+    elif C.ndim == 1:
+        Cinv = 1.0 / C.to(dtype=dtype, device=device)
+    else:
+        Cinv = torch.linalg.inv(C.to(dtype=dtype, device=device))
+
+    # ------------------------------------------------------------------
+    # Stage 1 – oversampled scouting
+    # ------------------------------------------------------------------
+    n_scouts = int(math.ceil(oversample * n_particles))
+    engine   = SobolEngine(dimension=len(param_bounds), scramble=True, seed=seed)
+
+    bounds = torch.as_tensor(param_bounds, dtype=dtype, device=device)
+    low, high = bounds[:, 0], bounds[:, 1]
+
+    scouts_u = engine.draw(n_scouts).to(dtype=dtype, device=device)
+    scouts   = low + (high - low) * scouts_u       # (n_scouts, D)
+
+    # fast χ² evaluation (no grads)
+    chi2_scouts = iterated_chi2(
+        scouts, Y=Y.to(device), f=f, Cinv=Cinv,
+    )
+
+    # --- Start of Patch ---
+    # Filter out NaNs from the scouts' chi2 values
+    valid_mask = ~torch.isnan(chi2_scouts)
+    valid_chi2_scouts = chi2_scouts[valid_mask]
+    valid_scouts = scouts[valid_mask]
+
+    if verbose and not torch.all(valid_mask):
+        print(f"⇢ Filtered out {torch.sum(~valid_mask)} NaN values.")
+
+    # keep the best ‘keep_frac’ fraction from the valid scouts
+    k = max(1, int(keep_frac * n_scouts))
+    
+    # Ensure k is not larger than the number of valid scouts
+    num_valid_scouts = valid_scouts.shape[0]
+    k = min(k, num_valid_scouts)
+
+    if k > 0:
+        top_vals, top_idx = torch.topk(-valid_chi2_scouts, k)  # negative → ascending
+        survivors = valid_scouts[top_idx]                      # (k, D)
+    else:
+        # Handle the case where there are no valid scouts left
+        survivors = torch.empty((0, scouts.shape[1]), dtype=dtype, device=device)
+    # --- End of Patch ---
+
+    if verbose:
+        if k > 0:
+            best_raw = (-top_vals).min().item()
+            print(f"⇢ Scouted {n_scouts} points, found {num_valid_scouts} valid, best raw χ² = {best_raw/n_chi:.4g}")
+            print(f"⇢ Keeping {k} best points for LM refinement …")
+            print((-top_vals).cpu().numpy()/n_chi)
+        else:
+            print(f"⇢ Scouted {n_scouts} points, but no valid (non-NaN) points were found.")
+
+
+    # ------------------------------------------------------------------
+    # Stage 2 – serial LM refinement
+    # ------------------------------------------------------------------
+    history  = []
+    best_val = torch.tensor(float("inf"), dtype=dtype, device=device)
+    best_X   = None
+    best_L   = None
+
+    for i, x0 in enumerate(survivors, 1):
+        res = lm_fn(x0.clone(), **lm_kwargs)           # (X, L, chi2)
+        X_opt, L_opt, chi2_opt = res
+
+        history.append(dict(idx=i,
+                            X=X_opt.detach().cpu(),
+                            chi2=float(chi2_opt),
+                            L=float(L_opt)))
+
+        if chi2_opt < best_val:
+            best_val = chi2_opt.detach()
+            best_X   = X_opt.detach().clone()
+            best_L   = L_opt
+
+        if verbose:
+            print(f"[{i:>3}/{k}] χ²={chi2_opt.item():.4g}   "
+                  f"best={best_val.item():.4g}")
+
+    return best_X, best_val, best_L, history
