@@ -19,9 +19,10 @@ def _leggauss_const(n, dtype, device):
 # 2.  Pure-Torch mapping keeps autograd alive and avoids graph breaks.
 def leggauss_interval(n, t_low, t_high, device=None, dtype=None):
     x0, w0 = _leggauss_const(n, dtype, device)
+    half_const = torch.tensor(0.5, dtype=dtype, device=device)
 
-    half = 0.5 * (t_high - t_low)        # tensor ops → differentiable
-    mid  = 0.5 * (t_high + t_low)
+    half = half_const * (t_high - t_low)
+    mid  = half_const * (t_high + t_low)
 
     # allow t_low / t_high to be batched – add a dim for broadcasting
     x = half.unsqueeze(-1) * x0 + mid.unsqueeze(-1)
@@ -101,8 +102,8 @@ class MGEVelocityIntr(Module):
         self.quad_points = quad_points
         self.radius_res = radius_res
 
-        self.soft = soft
-        self.G = G
+        self.soft = torch.tensor(soft, device=device, dtype=dtype)
+        self.G = torch.tensor(G, device=device, dtype=dtype)
         self.inc = Param("inc",   shape=())
 
     def radial_velocity(self, R_flat,
@@ -111,61 +112,74 @@ class MGEVelocityIntr(Module):
         """
         Compute the rotational velocity at radii R_flat, but use a
         double-exponential transform from [0,1] -> (0,∞).
-        """        
-        sqrt_2pi = np.sqrt(2.0*np.pi)
+        """
+        # --- Type-Safe Constants Definition ---
+        # Define EVERY float literal as a tensor to prevent silent promotion.
+        _p5 = torch.tensor(0.5, device=self.device, dtype=self.dtype)
+        _1 = torch.tensor(1.0, device=self.device, dtype=self.dtype)
+        _2 = torch.tensor(2.0, device=self.device, dtype=self.dtype)
+        _10 = torch.tensor(10.0, device=self.device, dtype=self.dtype)
+        _pi = torch.tensor(np.pi, device=self.device, dtype=self.dtype)
+        _1e_7 = torch.tensor(1e-7, device=self.device, dtype=self.dtype)
+        _1e3 = torch.tensor(1e3, device=self.device, dtype=self.dtype)
+        _neg_1p5 = torch.tensor(-1.5, device=self.device, dtype=self.dtype)
+        # --- End Constants Definition ---
+
+        sqrt_2pi = torch.sqrt(_2 * _pi)
         qobs = torch.sqrt(qintr**2 * (torch.sin(inc))**2 + (torch.cos(inc))**2)
         mass_density = surf * M_to_L * qobs / (qintr * sigma * sqrt_2pi)
-        
+
         N_points = R_flat.shape[0]
-        
+
         # Scale by median sigma
-        scale = sigma.quantile(q = 0.5)
+        scale = sigma.quantile(q=0.5)
         sigma_sc = sigma / scale
         R_sc = R_flat / scale
         soft_sc = self.soft / scale
 
-        mds = sigma_sc.quantile(q = 0.5)
+        mds = sigma_sc.quantile(q=0.5)
         mxs = torch.max(sigma_sc)
-        xlim = (torch.arcsinh(torch.log(1e-7 * mds)*2/np.pi),
-            torch.arcsinh(torch.log(1e3  * mxs)*2/np.pi))
-        
+
+        xlim = (torch.arcsinh(torch.log(_1e_7 * mds) * _2 / _pi),
+                torch.arcsinh(torch.log(_1e3 * mxs) * _2 / _pi))
+
         # --- Gauss–Legendre on [0,1] ---
         lo, hi = xlim
-        t_1d, w_1d = leggauss_interval(self.quad_points, lo, hi, device = self.device, dtype = self.dtype)
-        
+        t_1d, w_1d = leggauss_interval(self.quad_points, lo, hi, device=self.device, dtype=self.dtype)
+
         # --- Double-exponential transform t->u in (0,∞) ---
         u_1d, du_1d = transform_DE(t_1d)
-        
-        R_i  = R_sc.view(-1, 1, 1)                     # (N,1,1)
-        u_j  = u_1d.view(1,  -1, 1)                    # (1,Q,1)torch.linspace(-1, 1, nx, device=device, dtype=dtype) * pixelscale * (nx - 1) / 2
-        w_j  = w_1d.view(1,  -1, 1)                    # (1,Q,1)
+
+        R_i = R_sc.view(-1, 1, 1)                     # (N,1,1)
+        u_j = u_1d.view(1, -1, 1)                    # (1,Q,1)
+        w_j = w_1d.view(1, -1, 1)                    # (1,Q,1)
         du_j = du_1d.view(1, -1, 1)                    # (1,Q,1)
-        
-        sigma_mat    = sigma_sc.view(1, 1, -1)         # (1,1,C)
-        qintr_mat   = qintr.view(1, 1, -1)           # (1,1,C)
+
+        sigma_mat = sigma_sc.view(1, 1, -1)         # (1,1,C)
+        qintr_mat = qintr.view(1, 1, -1)           # (1,1,C)
         mass_den_mat = mass_density.view(1, 1, -1)     # (1,1,C)
-        
+
         # ---- kernel -----------------------------------------------------------------
-        one_plus = 1.0 + u_j                           # (1,Q,1)
-        exp_val  = torch.exp(-0.5 * R_i.pow(2) /
-                             (sigma_mat.pow(2) * one_plus))          # (N,Q,C)
-        
-        denom    = one_plus.pow(2) * torch.sqrt(qintr_mat.pow(2) + u_j)
-        
-        term      = (qintr_mat * mass_den_mat * exp_val) / denom    # (N,Q,C)
-        weighted  = term * du_j * w_j                                # (N,Q,C)
-        
+        one_plus = _1 + u_j
+        exp_val = torch.exp(-_p5 * R_i.pow(_2) /
+                             (sigma_mat.pow(_2) * one_plus))
+
+        denom = one_plus.pow(_2) * torch.sqrt(qintr_mat.pow(_2) + u_j)
+
+        term = (qintr_mat * mass_den_mat * exp_val) / denom
+        weighted = term * du_j * w_j
+
         # ---- quadrature & component sums -------------------------------------------
-        integral_val = weighted.sum(dim=1).sum(dim=1)   # (N,)
-        
+        integral_val = weighted.sum(dim=1).sum(dim=1)
+
         # ---- finish exactly as before ----------------------------------------------
-        vc2_mge_factor = 2.0 * np.pi * self.G * (scale**2)
+        vc2_mge_factor = _2 * _pi * self.G * (scale**_2)
         vc2_mge = vc2_mge_factor * integral_val
-        
-        vc2_bh = self.G * 10**m_bh / scale * (R_sc**2 + soft_sc**2).pow(-1.5)
-        
-        v_rot_flat = R_sc * torch.sqrt(vc2_mge + vc2_bh)   # (N,)
-        
+
+        vc2_bh = self.G * _10**m_bh / scale * (R_sc**_2 + soft_sc**_2).pow(_neg_1p5)
+
+        v_rot_flat = R_sc * torch.sqrt(vc2_mge + vc2_bh)
+
         return v_rot_flat
         
     @forward
@@ -209,12 +223,18 @@ class Nuker_MGE(Module):
         self.MGE.M_to_L = torch.tensor([1.0], dtype = dtype, device = device)
         self.NN = Nuker_NN
 
-        inner_slope=torch.tensor([3], device = device, dtype = dtype)
-        outer_slope=torch.tensor([3], device = device, dtype = dtype)
+        inner_slope=torch.tensor([3.0], device = device, dtype = dtype)
+        outer_slope=torch.tensor([3.0], device = device, dtype = dtype)
         low_Gauss=torch.log10(r_min/torch.sqrt(inner_slope))
         high_Gauss=torch.log10(r_max/torch.sqrt(outer_slope))
         dx=(high_Gauss-low_Gauss)/self.N_components
-        self.sigma = (distance * (np.pi/0.648))*10**(low_Gauss+(0.5+torch.arange(self.N_components, device = device))*dx).to(dtype = dtype)
+        
+        # --- SOLUTION ---
+        # Ensure all scalars are tensors of the correct dtype before the calculation
+        distance_t = torch.tensor(distance, device=device, dtype=dtype)
+        pi_t = torch.tensor(np.pi, device=device, dtype=dtype)
+        
+        self.sigma = (distance_t * (pi_t / 0.648)) * 10**(low_Gauss + (0.5 + torch.arange(self.N_components, device=device, dtype=dtype)) * dx)
         
         self.inc   = Param("inc",   shape=())
         self.qintr = Param("qintr", shape=())
@@ -232,7 +252,13 @@ class Nuker_MGE(Module):
         self.NN_dtype = NN_dtype
     
     def symexp(self, y, linthresh=1e-12, base=10.0):
-        return torch.sign(y) * linthresh * (base**torch.abs(y) - 1.0)
+        # --- SOLUTION ---
+        # Create tensor constants that match the input tensor's properties
+        linthresh_t = torch.tensor(linthresh, device=y.device, dtype=y.dtype)
+        base_t = torch.tensor(base, device=y.device, dtype=y.dtype)
+        one_t = torch.tensor(1.0, device=y.device, dtype=y.dtype)
+    
+        return torch.sign(y) * linthresh_t * (base_t**torch.abs(y) - one_t)
 
     @forward
     def velocity(self, R_flat,
@@ -242,9 +268,12 @@ class Nuker_MGE(Module):
         device = R_flat.device
         dtype  = R_flat.dtype
         beta = gamma - gmb
+        #print(beta.dtype)
+        #print(I_b.dtype)
+        #print(r_b.dtype)
 
-        NN_input = torch.cat([alpha, beta, gamma]).to(self.NN_dtype)
-        NN_output_transformed = self.NN.forward(NN_input).to(self.dtype)
+        NN_input = torch.cat([alpha, beta, gamma])#.to(self.NN_dtype)
+        NN_output_transformed = self.NN.forward(NN_input)#.to(self.dtype)
         NN_output = self.symexp(NN_output_transformed)
         
         surf = NN_output*10**I_b
