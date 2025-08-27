@@ -268,9 +268,6 @@ class Nuker_MGE(Module):
         device = R_flat.device
         dtype  = R_flat.dtype
         beta = gamma - gmb
-        #print(beta.dtype)
-        #print(I_b.dtype)
-        #print(r_b.dtype)
 
         NN_input = torch.cat([alpha, beta, gamma])#.to(self.NN_dtype)
         NN_output_transformed = self.NN.forward(NN_input)#.to(self.dtype)

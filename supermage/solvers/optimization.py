@@ -25,6 +25,92 @@ def cg_solve(hvp, b, x0=None, tol=1e-6, maxiter=20):
         rs_old = rs_new
     return x
 
+
+def lm_cg_autograd_stable(
+    X, Y, f, n_chi,
+    C=None,
+    epsilon=1e-1, L=1.0, L_dn=11.0, L_up=9.0,
+    max_iter=50, cg_maxiter=20, cg_tol=1e-6,
+    L_min=1e-9, L_max=1e9,
+    stopping=1e-4,
+    verbose=True,
+):
+    if C is None:
+        Cinv = torch.ones_like(Y)
+    elif C.ndim == 1:
+        Cinv = 1.0 / C
+    else:
+        Cinv = torch.linalg.inv(C)
+
+    # Use torch.autograd.grad for explicit gradient calculation
+    from torch.autograd import grad as torch_grad
+
+    def get_loss_and_grad(x_in):
+        x_ = x_in.detach().requires_grad_(True)
+        fX = f(x_)
+        dY = Y - fX
+        chi2 = (dY**2 * Cinv).sum()
+        loss = 0.5 * chi2
+        grad = torch_grad(loss, x_, allow_unused=True)[0]
+        return chi2.detach(), loss.detach(), grad
+
+    def hvp(v, current_x, current_L):
+        x_ = current_x.detach().requires_grad_(True)
+        fX = f(x_)
+        dY = Y - fX
+        loss = 0.5 * (dY**2 * Cinv).sum()
+        grad_L = torch_grad(loss, x_, create_graph=True, allow_unused=True)[0]
+        hvp_L = torch_grad((grad_L * v).sum(), x_, retain_graph=True, allow_unused=True)[0]
+        return hvp_L + current_L * v
+
+    chi2, _, grad = get_loss_and_grad(X)
+
+    if verbose:
+        print(f"{'Iter':>4} | {'chi2/n':>12} | {'chi2_new/n':>12} | {'λ':>8} | {'ρ':>6} | {'acc':>5}")
+        print("-"*65)
+
+    for it in range(max_iter):
+        hvp_for_cg = lambda v: hvp(v, X, L)
+        h = cg_solve(hvp_for_cg, -grad, maxiter=cg_maxiter, tol=cg_tol)
+
+        chi2_new, _, _ = get_loss_and_grad(X + h)
+
+        actual_reduction = chi2 - chi2_new
+        pred_reduction = -torch.dot(h, grad) - 0.5 * torch.dot(h, hvp(h, X, 0.0))
+        
+        # --- START: THIS IS THE FIX ---
+        # A valid step should result in a positive predicted reduction.
+        # If not, the quadratic approximation is poor, and the step should be rejected.
+        if pred_reduction > 0:
+            rho = actual_reduction / pred_reduction
+        else:
+            # Force rejection of the step if the model predicts an increase in chi-squared
+            rho = torch.tensor(-1.0) 
+        # --- END: THIS IS THE FIX ---
+
+        accepted = (rho >= epsilon)
+        if accepted:
+            X, chi2 = X + h, chi2_new
+            L = max(L / L_dn, L_min)
+            _, _, grad = get_loss_and_grad(X) # Recalculate gradient at the new point
+        else:
+            L = min(L * L_up, L_max)
+
+        if verbose:
+            # Use chi2/n_chi for the current accepted value in the printout
+            current_chi2_val = chi2 if accepted else get_loss_and_grad(X)[0]
+            print(f"{it:4d} | {current_chi2_val.item()/n_chi:12.4e} | {chi2_new.item()/n_chi:12.4e} | {L:8.2e} | {rho.item():6.3f} | {str(bool(accepted)):>5}")
+
+        if torch.norm(h) < stopping:
+            if verbose: print("Stopping: Step size below threshold.")
+            break
+            
+        if torch.isnan(rho) or rho.item() < -100: # break on divergence
+            if verbose: print("Stopping: Rho is NaN or diverging.")
+            break
+
+    return X, L, chi2
+
 def lm_cg_autograd(
     X, Y, f, n_chi,
     C=None,
