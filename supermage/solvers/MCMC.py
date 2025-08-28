@@ -135,7 +135,7 @@ def mala_chi(
         mu_x  = x + 0.5 * (eps**2) * (grad_cur @ Σ)                 # (C,D)
         noise = torch.randn(C, D, generator=rng, device=device, dtype=dtype) @ L.T
         x_prop = mu_x + eps * noise
-
+        
         # single forward+backward at proposal
         logp_prop, grad_prop = _logp_and_grad_batch(x_prop, log_prob_fn)
 
