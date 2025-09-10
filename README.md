@@ -7,7 +7,7 @@
 </picture>
 
 # supermage
-SuperMAGE: **Super**massive black hole **m**asses from **A**LMA observations of **g**as kin**e**matics
+SuperMAGE: **Super**massive black hole **ma**sses from **g**as kin**e**matics
 
 
 NOTE: Active development. Non-functioning and untested code may occur. For notebooks, see other repo.
