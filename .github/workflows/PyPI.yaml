@@ -32,22 +32,21 @@ jobs:
           pip install build
 
       - name: Verify meta version == tag
+        shell: bash
         run: |
           TAG="${{ github.event.release.tag_name }}"
           VER="${TAG#v}"  # strip leading 'v' if present
-          python - <<'PY'
-import pathlib, re, sys, os
-VER = os.environ["VER"]
-meta = pathlib.Path("supermage/__meta__.py").read_text()
-m = re.search(r'^\s*version\s*=\s*[\'"]([^\'"]+)[\'"]', meta, re.M)
-if not m:
-    print("Could not find version= in supermage/__meta__.py", file=sys.stderr)
-    sys.exit(1)
-meta_ver = m.group(1).strip()
-print("meta version:", meta_ver)
-print("tag version :", VER)
-sys.exit(0 if meta_ver == VER else 2)
-PY
+          META_VER=$(sed -nE "s/^[[:space:]]*version[[:space:]]*=[[:space:]]*['\"]([^'\"]+)['\"]/\\1/p" supermage/__meta__.py)
+          echo "meta version: $META_VER"
+          echo "tag  version: $VER"
+          if [ -z "$META_VER" ]; then
+            echo "ERROR: Could not find version= in supermage/__meta__.py"
+            exit 1
+          fi
+          if [ "$META_VER" != "$VER" ]; then
+            echo "ERROR: meta version ($META_VER) != tag ($VER)"
+            exit 2
+          fi
 
       - name: Clean old artifacts
         run: rm -rf dist/ build/
