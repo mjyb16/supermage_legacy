@@ -1,8 +1,8 @@
-name: Upload Python Package to PyPI when a Release is Created
+name: Upload Python Package to PyPI when a Release is Published
 
 on:
   release:
-    types: [created]
+    types: [published]
 
 jobs:
   pypi-publish:
@@ -12,19 +12,35 @@ jobs:
       name: pypi
       url: https://pypi.org/p/supermage
     permissions:
-      id-token: write
+      id-token: write  # for PyPI Trusted Publishing (no API token needed)
+
     steps:
-      - uses: actions/checkout@v4
-      - name: Set up Python
-        uses: actions/setup-python@v4
+      - name: Check out the release tag
+        uses: actions/checkout@v4
         with:
-          python-version: "3.x"
-      - name: Install dependencies
+          ref: ${{ github.event.release.tag_name }}  # e.g., v0.1.2
+          fetch-depth: 0                             # required so tags are present
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install build tooling
         run: |
           python -m pip install --upgrade pip
-          pip install setuptools wheel
-      - name: Build package
-        run: |
-          python setup.py sdist bdist_wheel  # Could also be python -m build
+          pip install build
+
+      - name: Clean old artifacts
+        run: rm -rf dist/ build/
+
+      - name: Sanity: print tag
+        run: echo "Release tag is ${{ github.event.release.tag_name }}"
+
+      - name: Build sdist and wheel
+        run: python -m build
+
       - name: Publish package distributions to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true  # safe for reruns
