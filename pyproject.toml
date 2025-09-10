@@ -1,11 +1,16 @@
 [build-system]
-requires = ["setuptools", "wheel"]
+requires = ["setuptools>=64", "setuptools_scm[toml]>=8", "wheel", "build"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools_scm]
+# Accept tags like v0.1.2 or 0.1.2
+tag_regex = "^v?(?P<version>\\d+\\.\\d+\\.\\d+(?:[a-zA-Z0-9\\.\\-+]*)?)$"
+version_scheme = "no-guess-dev"
+local_scheme = "no-local-version"
 
 [tool.black]
 target-version = ["py38"]
 
-# pyproject.toml
 [tool.pytest.ini_options]
 minversion = "6.0"
 addopts = "--failed-first"
