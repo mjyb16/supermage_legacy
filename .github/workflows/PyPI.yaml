@@ -12,14 +12,14 @@ jobs:
       name: pypi
       url: https://pypi.org/p/supermage
     permissions:
-      id-token: write  # for PyPI Trusted Publishing (no API token needed)
+      id-token: write  # for PyPI Trusted Publishing
 
     steps:
       - name: Check out the release tag
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.release.tag_name }}  # e.g., v0.1.2
-          fetch-depth: 0                             # required so tags are present
+          ref: ${{ github.event.release.tag_name }}   # e.g. v0.1.2
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -31,16 +31,31 @@ jobs:
           python -m pip install --upgrade pip
           pip install build
 
+      - name: Verify meta version == tag
+        run: |
+          TAG="${{ github.event.release.tag_name }}"
+          VER="${TAG#v}"  # strip leading 'v' if present
+          python - <<'PY'
+import pathlib, re, sys, os
+VER = os.environ["VER"]
+meta = pathlib.Path("supermage/__meta__.py").read_text()
+m = re.search(r'^\s*version\s*=\s*[\'"]([^\'"]+)[\'"]', meta, re.M)
+if not m:
+    print("Could not find version= in supermage/__meta__.py", file=sys.stderr)
+    sys.exit(1)
+meta_ver = m.group(1).strip()
+print("meta version:", meta_ver)
+print("tag version :", VER)
+sys.exit(0 if meta_ver == VER else 2)
+PY
+
       - name: Clean old artifacts
         run: rm -rf dist/ build/
-
-      - name: Sanity: print tag
-        run: echo "Release tag is ${{ github.event.release.tag_name }}"
 
       - name: Build sdist and wheel
         run: python -m build
 
-      - name: Publish package distributions to PyPI
+      - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          skip-existing: true  # safe for reruns
+          skip-existing: true
