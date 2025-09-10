@@ -14,6 +14,12 @@ supermage
 SuperMAGE: **Super**\ massive black hole **ma**\ sses from **g**\ as
 kin\ **e**\ matics
 
+While gas dynamical SMBH mass measurement is SuperMAGE's primary use
+case, as a modular simulator, you can use any of its modules for any
+purpose. Broadly speaking, if you work with spectral cubes and/or
+rotation curves in galaxies, you might find SuperMAGE useful for your
+work.
+
 NOTE: Active development. Non-functioning and untested code may occur.
 For notebooks, see other repo.
 
