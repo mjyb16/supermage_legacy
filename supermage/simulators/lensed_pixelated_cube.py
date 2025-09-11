@@ -31,7 +31,7 @@ class CubeLens(Module):
         thx, thy = caustics.utils.meshgrid(
             pixelscale_lens / upsample_factor,
             upsample_factor * pixels_x_lens,
-            dtype=torch.float32, device = source_cube.device, dtype = source_cube.dtype
+            device = source_cube.device, dtype = source_cube.dtype
         )
 
         self.thx = thx
