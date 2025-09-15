@@ -4,6 +4,44 @@ from torch.func import jvp, vjp
 from torch.func import jacrev, jacfwd  # (PyTorch ≥2.0; for older versions import from functorch)
 from torch.autograd import grad as torch_grad
 
+
+def cg_solve_static(hvp, b, *, maxiter=50, tol=1e-6):
+    """
+    Conjugate-gradient that is *vmap-safe*:
+    * fixed number of Python iterations (maxiter),
+    * no data-dependent `break`,
+    * no `.item()` or Tensor→bool conversion.
+
+    Args
+    ----
+    hvp : callable(v) -> H·v              Hessian-vector product closure
+    b   : (N,) Tensor                     right-hand side
+    tol : float                           residual L2 tolerance (used for masking)
+    """
+    x  = torch.zeros_like(b)
+    r  = b.clone()
+    p  = r.clone()
+    rs = torch.dot(r, r).unsqueeze(0)     # shape (1,) so we can `where`
+
+    for _ in range(maxiter):
+        Ap    = hvp(p)
+        alpha = rs / (torch.dot(p, Ap).clamp_min(1e-12)).unsqueeze(0)
+        x_new = x + alpha * p
+        r_new = r - alpha * Ap
+        rsn   = torch.dot(r_new, r_new).unsqueeze(0)
+
+        # stop updating once residual < tol
+        active = (torch.sqrt(rsn) >= tol).float()     # 0. or 1.
+        beta   = torch.where(active.bool(), rsn / rs, torch.zeros_like(rsn))
+
+        # in-place masked updates
+        x  = torch.where(active.bool(), x_new, x)
+        p  = torch.where(active.bool(), r_new + beta * p, p)
+        r  = torch.where(active.bool(), r_new, r)
+        rs = torch.where(active.bool(), rsn, rs)
+
+    return x
+
 def cg_solve(hvp, b, x0=None, tol=1e-6, maxiter=20):
     if x0 is None:
         x = torch.zeros_like(b)
@@ -295,9 +333,27 @@ def lm_cg_og(
     max_iter=50, cg_maxiter=20, cg_tol=1e-6,
     L_min=1e-9, L_max=1e9,
     stopping=1e-4,
-    verbose=True,               # <-- new flag 
+    verbose=True,
 ):
-    # prepare Cinv
+    """
+    Levenberg-Marquardt with conjugate-gradient step that is *vmap-friendly*:
+    – fixed iteration count (no data-dependent breaks)
+    – masking with torch.where for all updates
+    – no Python branching on tensor values
+    """
+
+    # ---- constants as tensors so we can broadcast in torch.where ----
+    X       = X.clone()                       # ensure we can write in-place
+    dtype   = X.dtype
+    device  = X.device
+    L       = torch.tensor(L,      dtype=dtype, device=device)
+    L_dn_t  = torch.tensor(L_dn,   dtype=dtype, device=device)
+    L_up_t  = torch.tensor(L_up,   dtype=dtype, device=device)
+    L_min_t = torch.tensor(L_min,  dtype=dtype, device=device)
+    L_max_t = torch.tensor(L_max,  dtype=dtype, device=device)
+    eps_t   = torch.tensor(epsilon,dtype=dtype, device=device)
+
+    # ---- prepare inverse covariance --------------------------------
     if C is None:
         Cinv = torch.ones_like(Y)
     elif C.ndim == 1:
@@ -305,67 +361,64 @@ def lm_cg_og(
     else:
         Cinv = torch.linalg.inv(C)
 
+    # ---- helpers ----------------------------------------------------
     def chi2_and_grad(x):
-        fY  = f(x)
-        dY  = Y - fY
-        chi2= (dY**2 * Cinv).sum()
-        _, vjp_fn = vjp(f, x)
-        grad = vjp_fn(Cinv * dY)[0]
-        return chi2, grad
+        fY          = f(x)
+        dY          = Y - fY
+        chi2_val    = (dY**2 * Cinv).sum()
+        _, vjp_fun  = vjp(f, x)
+        grad_val    = vjp_fun(Cinv * dY)[0]
+        return chi2_val, grad_val
 
     def hvp(v):
         _, jvp_out = jvp(f, (X,), (v,))
-        w = Cinv * jvp_out
-        _, vjp_fn = vjp(f, X)
-        return vjp_fn(w)[0] + L * v
+        w          = Cinv * jvp_out
+        _, vjp_fun = vjp(f, X)
+        return vjp_fun(w)[0] + L * v
 
+    # ---- initial chi² / grad ---------------------------------------
     chi2, grad = chi2_and_grad(X)
+
+    # ---- optional header print -------------------------------------
     if verbose:
-        print(f"{'Iter':>4} | {'chi2':>12} | {'chi2_new':>12} | {'λ':>8} | {'ρ':>6} | {'acc':>4}")
-        print("-"*60)
+        print(f"{'Iter':>4} | {'chi2':>12} | {'chi2_new':>12} | {'λ':>8} | {'ρ':>6} | acc")
 
+    # ---- main LM loop (static length) ------------------------------
     for it in range(max_iter):
-        # solve for step h
-        h = cg_solve(hvp, grad, maxiter=cg_maxiter, tol=cg_tol)
 
-        # evaluate new χ²
-        chi2_new, _ = chi2_and_grad(X + h)
-        expected = torch.dot(h, hvp(h) + grad)
-        rho = (chi2 - chi2_new) / torch.abs(expected)
+        # CG step (vmap-safe implementation you already added)
+        h = cg_solve_static(hvp, grad, maxiter=cg_maxiter, tol=cg_tol)
 
-        accepted = (rho >= epsilon)
-        # update
-        if accepted:
-            X, chi2 = X + h, chi2_new
-            L = max(L / L_dn, L_min)
-        else:
-            L = min(L * L_up, L_max)
+        # proposed new parameters and stats
+        chi2_new, grad_new = chi2_and_grad(X + h)
+        expected           = torch.dot(h, hvp(h) + grad)
+        rho                = (chi2 - chi2_new) / expected.abs()
 
-        if verbose:
-            i = 2
-            D = X.numel()
+        accepted           = (rho >= eps_t)
 
-            # build a basis vector e_i
-            e_i = torch.zeros(D, device=X.device, dtype=X.dtype)
-            e_i[i] = 1.0
-            
-            # apply your hvp to get (H + L·I)·e_i
-            Hi_plus_L = hvp(e_i)[i].item()
-            
-            # subtract off the damping to get the true diagonal H_{ii}
-            H_ii = Hi_plus_L - L
-            
-            #print(f"param[{i}]: grad={grad[i].item():.3e}, H_ii={H_ii:.3e}, L={L:.3e}")
-            print(f"{it:4d} | {chi2.item()/n_chi:12.4e} | {chi2_new.item()/n_chi:12.4e} | {L:8.2e} | {rho.item():6.3f} | {str(bool(accepted)):>4} ")
-            #print(X)
+        # masked parameter / state updates
+        X    = torch.where(accepted, X + h, X)
+        chi2 = torch.where(accepted, chi2_new, chi2)
+        grad = torch.where(accepted, grad_new, grad)
 
-        if torch.norm(h) < stopping:
-            break
-        if np.isnan(rho.item()):
-            break
+        L = torch.where(
+            accepted,
+            torch.clamp(L / L_dn_t, min=L_min_t),
+            torch.clamp(L * L_up_t, max=L_max_t),
+        )
 
-        # new gradient
-        _, grad = chi2_and_grad(X)
+        # ---- progress print (only if prints are enabled) -------
+        # if verbose:
+        #     chi_disp  = (chi2 / n_chi).item()
+        #     chi_n_disp= (chi2_new / n_chi).item()
+        #     print(f"{it:4d} | {chi_disp:12.4e} | {chi_n_disp:12.4e} | "
+        #             f"{L.item():8.2e} | {rho.item():6.3f} | {bool(accepted.item())}")
+
+        # stopping rule (masked; keeps loop static)
+        converged   = (torch.norm(h) < stopping)
+        # once converged, we could early-exit all subsequent
+        # computation with a mask; here we just continue to keep
+        # the control-flow static and cheap.
 
     return X, L, chi2
 
