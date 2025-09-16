@@ -3,9 +3,9 @@
 .. raw:: html
 
    <picture>
-     <source media="(prefers-color-scheme: dark)" srcset="https://github.com/mjyb16/supermage/blob/master/SuperMAGE%20logo_text.svg" width="70%" height="70%">
-     <source media="(prefers-color-scheme: light)" srcset="https://github.com/mjyb16/supermage/blob/master/SuperMAGE%20logo_text.svg" width="70%" height="70%">
-     <img alt="SuperMAGE logo" src="https://github.com/mjyb16/supermage/blob/master/SuperMAGE%20logo_text.svg" width="70%">
+     <source media="(prefers-color-scheme: dark)" srcset="https://github.com/mjyb16/supermage_legacy/blob/master/SuperMAGE%20logo_text.svg" width="70%" height="70%">
+     <source media="(prefers-color-scheme: light)" srcset="https://github.com/mjyb16/supermage_legacy/blob/master/SuperMAGE%20logo_text.svg" width="70%" height="70%">
+     <img alt="SuperMAGE logo" src="https://github.com/mjyb16/supermage_legacy/blob/master/SuperMAGE%20logo_text.svg" width="70%">
    </picture>
 
 supermage
